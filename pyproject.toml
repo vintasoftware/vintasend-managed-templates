@@ -1,6 +1,6 @@
 [project]
 name = "vintasend-managed-templates"
-version = "0.1.0"
+version = "3.0.0"
 description = "Starting point for a new vintasend-* implementation package: one TODO stub per seam, ready to clone."
 authors = [{ name = "Hugo Bessa", email = "hugo@vinta.com.br" }]
 license = "MIT"
@@ -19,7 +19,7 @@ include = [
 [tool.poetry.dependencies]
 # Pinned to the current vintasend line (2.0) so a freshly cloned package starts
 # with a correct, working pin against the seams this template's stubs subclass.
-vintasend = { path = "../..", develop = true }
+vintasend = "3.0.0"
 # filters.py imports it directly for the py310 generic-TypedDict fallback. vintasend already
 # depends on it, but a direct import gets a direct declaration.
 typing-extensions = ">=4.10.0"
