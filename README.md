@@ -32,6 +32,7 @@ Python 3.10–3.14. The only dependencies are `vintasend` itself and `typing-ext
 | `BaseTemplateManagerBackend` | The storage seam. An ABC covering template CRUD, versions, status history, tags, filtering, and pagination. |
 | `ManagedTemplateService` | The API you call. Wraps a backend and a renderer with version resolution, status-transition rules, filter validation, and tag normalization. |
 | `ManagedTemplateEmailRenderer` / `ManagedTemplateSMSRenderer` | A vintasend template renderer that wraps *another* renderer and feeds it a stored template instead of a template path. |
+| `composition.TemplateComposer` | Resolves template inheritance and inclusion against the store, before the engine runs. |
 | `tags.slugify_tag` / `next_available_slug` | The shared slug rules, so every backend derives the same slug from the same text. |
 | `dataclasses`, `constants`, `filters`, `exceptions` | The wire types: `ManagedTemplate`, `ManagedTemplateTag`, the two status enums, the filter TypedDicts, and the error hierarchy. |
 
@@ -119,6 +120,179 @@ inner_renderer = JinjaTemplatedEmailRenderer(Environment(loader=FunctionLoader(l
 ```
 
 A renderer written to compile source directly needs no such setup.
+
+## Composition: bases, blocks and includes
+
+A file-based renderer gets composition for free. Django's `{% extends %}` and Jinja's
+`{% include %}` hand a *name* to a loader, and a loader reads files — so the header, the footer and
+the wrapper every email shares live in one file that every other file points at.
+
+Managed templates are not files. They reach the engine as source, so a loader has nothing to
+resolve and those tags have nothing to load. Without composition the shared chrome would have to be
+pasted into every row in the store, and changing the footer would mean editing all of them.
+
+This package resolves its own set of tags **before** the engine sees anything. What the engine
+receives is one flat string with no `managed_*` tag left in it; its own syntax is untouched.
+
+```python
+service.create_template(ManagedTemplateCreateInput(
+    name="Base email", description="The wrapper every email uses", key="base-email",
+    template_managed_backend="django",
+    template_body=(
+        "<html>\n"
+        "  <body>\n"
+        "    {% managed_block header %}<h1>Acme</h1>{% managed_endblock %}\n"
+        "    {% managed_children %}\n"
+        "    {% managed_include \"footer\" %}\n"
+        "  </body>\n"
+        "</html>"
+    ),
+    template_subject="[Acme] {% managed_children %}",
+    template_preheader=None, tenant=None,
+))
+
+service.create_template(ManagedTemplateCreateInput(
+    name="Welcome email", description="Sent right after signup", key="welcome",
+    template_managed_backend="django",
+    template_body=(
+        "{% managed_extends \"base-email\" %}\n"
+        "{% managed_block header %}<h1>Welcome!</h1>{% managed_endblock %}\n"
+        "<p>Hi {{ name }}, welcome aboard.</p>"
+    ),
+    template_subject="{% managed_extends \"base-email\" %}Welcome aboard",
+    template_preheader=None, tenant=None,
+))
+```
+
+`welcome` now renders inside the base, with its own header and the shared footer, and its subject
+comes out as `[Acme] Welcome aboard`. `{{ name }}` is never looked at — the context is the engine's
+business.
+
+### The tags
+
+| Tag | What it does |
+|---|---|
+| `{% managed_extends "key" %}` | This template is a child of `key`. At most one per template, never inside a block. Pin the parent with `"key[v2]"` or `version=2`. |
+| `{% managed_children %}` | In a base: where the child's content goes. Rendered with no child, the hole is simply empty. |
+| `{% managed_block name %}…{% managed_endblock %}` | A named region a child may replace. Unreplaced, it renders what it was declared with. Blocks may nest. |
+| `{% managed_super %}` | Inside a child's block: the content it is overriding. Chains through as many levels of inheritance as there are. |
+| `{% managed_include "key" %}` | Splice another template in here. It is composed in full first, so an include may itself extend and include. Pins the same way: `"key[v7]"`. |
+
+Everything a child writes **outside** a block is its children content, and it lands in the base's
+`{% managed_children %}`. So a child can both fill the hole and override named regions — which is
+the one difference from Django, where content outside a block in a child template is discarded.
+
+The `managed_` prefix is reserved: an unknown `{% managed_something %}` is an error rather than
+text passed through, so a typo surfaces at edit time instead of shipping. Change the prefix by
+handing the renderer or the service its own composer:
+
+```python
+from vintasend_managed_templates.composition import TemplateComposer
+
+composer = TemplateComposer.from_backend(manager_backend, tag_prefix="tpl_")
+renderer = ManagedTemplateEmailRenderer(manager_backend, inner_renderer, composer=composer)
+```
+
+### One field at a time
+
+A template carries three sources — body, subject and preheader — and each composes against the
+**same field** of the template it references. A child's body extends the base's body; its subject
+extends the base's subject. So a base can define a subject prefix and a body wrapper at once, and
+neither leaks into the other. A field the base leaves empty composes to nothing rather than to an
+error.
+
+### Whitespace
+
+A structural tag (`extends`, `block`, `endblock`) alone on its line is taken out *with* the line,
+so a layout written across several lines does not compose into one padded with blank ones. The
+placeholder tags (`children`, `include`, `super`) are never line-trimmed: what replaces them lands
+exactly where the tag stood, indentation and all.
+
+### Abstract templates
+
+A template is *abstract* when it declares a `{% managed_children %}` hole, or declares blocks
+without extending anything — a layout meant to be built on rather than sent. That is a fact about
+the source, so it follows the template as it is edited: a template becomes abstract the moment
+someone writes the hole into it and stops being abstract the moment they take it out.
+
+**The check** recomputes from the source every time, which makes it the authority:
+
+```python
+service.is_abstract(base)      # True
+service.is_abstract(welcome)   # False
+```
+
+**The flag** is that same answer, denormalized onto the template so it can be queried:
+
+```python
+base.is_abstract                                          # True -- stored, not recomputed
+service.get_filtered_templates({"is_abstract": False})    # every sendable template
+```
+
+Filtering is the reason the flag exists. Without it, a picker that has to leave the bases out would
+read and parse every row in the store to draw one page. Nobody writes the flag — there is no field
+for it on either write input — because a stored copy that disagreed with the source would be a lie
+a filter goes on repeating. It is a **backend's job to derive it on every write** with
+`composition.is_abstract`; see [Implementing a manager backend](#implementing-a-manager-backend).
+
+Reach for the check when the flag cannot be trusted: a template edited in memory since it was read,
+or one written before its backend maintained the column.
+
+Composing an abstract template directly is allowed and gives you the layout with an empty hole.
+Neither the check nor the flag refuses anything — keeping bases out of a picker is the host's call.
+
+### Versions
+
+A reference with no version resolves the same way any other read does: to whatever version that key
+currently is. Pin it when a template must keep composing against an exact parent — re-rendering an
+old notification resolves the child's version explicitly, but its unpinned bases still resolve to
+today's.
+
+Two spellings, identical in meaning — the suffix reads better inline, `version=` reads better when
+the key is long:
+
+```
+{% managed_extends "base-email[v2]" %}
+{% managed_extends "base-email" version=2 %}
+{% managed_include "footer[v7]" %}
+```
+
+Naming a version both ways at once is a syntax error rather than a precedence rule nobody would
+remember. The `[vN]` suffix is reserved: a template key that genuinely ends in `[v3]` can only be
+referenced with `version=`.
+
+### Checking a template before it ships
+
+Composition failures are this package's, not the engine's, so nothing downstream can report them.
+Catch them where someone can still fix them:
+
+```python
+service.validate_composition(template)     # raises exactly what rendering would have
+service.get_composed_template("welcome")   # what the engine will actually receive
+service.get_template_references(template)  # the bases and fragments it names, unresolved
+```
+
+| Exception | Raised when |
+|---|---|
+| `ManagedTemplateCompositionSyntaxError` | A tag is malformed, unknown, or unbalanced |
+| `ManagedTemplateCompositionReferenceError` | A base or fragment does not exist (also a `ManagedTemplateNotFoundError`) |
+| `ManagedTemplateCompositionCycleError` | The references loop |
+| `ManagedTemplateCompositionDepthError` | The chain runs past the composer's `max_depth` (25 by default) |
+
+All four subclass `ManagedTemplateCompositionError`.
+
+### Turning it off
+
+Composition is on by default. A store that predates it and holds `managed_`-prefixed text meant to
+reach the engine verbatim can opt out:
+
+```python
+renderer = ManagedTemplateEmailRenderer(manager_backend, inner_renderer, compose_templates=False)
+service = ManagedTemplateService(manager_backend, renderer, compose_templates=False)
+```
+
+Reads are never composed either way: `get_template` hands back exactly what is stored, which is
+what an editing UI needs. `get_composed_template` is the explicit way to ask for the assembled form.
 
 ## Templates and versions
 
@@ -265,16 +439,52 @@ constrains nothing, an empty `includes_any_of_tags` matches nothing.
 
 ## Rendering a specific version
 
-`ManagedTemplateRenderer.render` resolves a key to whatever version the backend hands back, which
-is what you want at send time. The service's `render` takes an explicit version instead:
+Which version of a template a notification renders is decided in this order:
+
+1. an explicit `version=` argument to `service.render()`,
+2. the notification's own `requested_template_version`,
+3. whatever version the backend considers current.
 
 ```python
-service.render(notification, context, version=3)      # preview an unpublished draft
-service.render_template(notification, template, context)  # a template already in hand, no read
+service.render(notification, context)                 # the notification's pin, or the latest
+service.render(notification, context, version=3)      # preview v3 regardless of the pin
+service.render_template(notification, template, context)   # a template already in hand
 ```
 
-That is how you preview a draft before publishing it, or re-render an old notification against the
-version that was live when it was sent.
+The argument is for rendering a version the notification is *not* pinned to -- previewing an
+unpublished draft, or reproducing what an old notification looked like. Leave it off and you get
+what a real send would produce.
+
+### Pinning a notification to a version
+
+`ManagedTemplateRenderer` reads `requested_template_version` off the notification, so a
+notification recorded against v3 renders v3 however many versions follow. That field is
+vintasend's, not this package's -- see
+[Template Version Pinning](https://github.com/vintasoftware/vintasend#template-version-pinning)
+-- and this package is what makes it mean anything:
+
+```python
+notification_service.create_notification(
+    ...,
+    body_template="welcome",           # the template key
+    requested_template_version=3,      # render v3, now and forever
+)
+
+# Or pin to whatever version is current at this moment, without naming it:
+notification_service.create_notification(..., pin_template_versions=True)
+
+# The same, as the default for every call on the service:
+notification_service = NotificationService(..., pin_template_versions=True)
+```
+
+With `pin_template_versions=True`, the service asks this package's renderer for the current
+version through `get_latest_template_version()`, which resolves it the same way `get_template(key)`
+does. A key with nothing behind it answers `None` and the notification is created unpinned, rather
+than failing the creation over a template that may well exist by the time it is sent.
+
+Whichever version renders is reported back on the send input as `template_version`, so vintasend
+can store it as `used_template_version`. For an unpinned notification that is the only record of
+which version went out, since the template has moved on by the time anyone asks.
 
 ## Implementing a manager backend
 
@@ -289,8 +499,14 @@ groups:
   `get_paginated_templates`, `get_paginated_filtered_templates`
 
 What a backend owns, beyond storage: assigning version numbers, deriving tag slugs with
-`slugify_tag` and keeping them unique with `next_available_slug`, and translating the filter dicts
+`slugify_tag` and keeping them unique with `next_available_slug`, deriving `is_abstract` with
+`composition.is_abstract` on every write that touches a source, and translating the filter dicts
 into its own query language.
+
+`is_abstract` is the one easy to miss, because no method is named for it. It is a denormalization
+of the template's own source, kept so the `is_abstract` filter can be a column lookup instead of a
+full-store parse, and neither write input carries it. A backend that never sets it reports every
+template as concrete and that filter quietly stops working.
 
 `tests/fakes.py` in this repo has `InMemoryTemplateManagerBackend`, a complete, dependency-free
 implementation of the seam — the shortest readable reference for what each method owes its caller.
@@ -309,6 +525,7 @@ All of them subclass `ManagedTemplateError`:
 | `ManagedTemplateTagNotFoundError` | No tag has that slug |
 | `ManagedTemplateTagAlreadyExistsError` | `create_tag` collides with an existing slug |
 | `ManagedTemplateInvalidTagError` | A tag's text has nothing that can be slugified |
+| `ManagedTemplateCompositionError` | A template could not be assembled -- see [Composition](#composition-bases-blocks-and-includes) for its four subclasses |
 
 ## Development
 

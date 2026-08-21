@@ -119,6 +119,15 @@ class ManagedTemplateFilterFields(TypedDict, total=False):
     # nothing, an empty ``includes_any_of_tags`` matches nothing.
     includes_all_tags: TagsFieldFilter
     includes_any_of_tags: TagsFieldFilter
+    # Bases, or templates to send. ``True`` keeps only the templates that declare a
+    # ``{% managed_children %}`` hole or blocks without extending anything; ``False`` keeps
+    # only the ones that do not.
+    #
+    # Answered against the stored ``ManagedTemplate.is_abstract`` -- a column a backend writes
+    # on every write -- rather than by parsing sources at query time, which is the whole
+    # reason the flag is denormalized: a picker that has to exclude bases would otherwise read
+    # and parse every row in the store to draw one page.
+    is_abstract: BooleanFieldFilter
     # One row per key instead of one row per version. ``True`` keeps, for each key, only the
     # highest-numbered version whose status is in
     # ``MOST_RECENT_ACTIVE_VERSION_STATUSES`` (ACTIVE or DRAFT), and drops every key with no

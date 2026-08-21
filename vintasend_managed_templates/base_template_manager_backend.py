@@ -13,10 +13,29 @@ from .filters import ManagedTemplateFilter
 
 
 class BaseTemplateManagerBackend(ABC):
+    """Where managed templates are stored, versioned, tagged and queried.
+
+    One responsibility here is easy to miss because no method is named for it:
+    **``ManagedTemplate.is_abstract`` is the backend's to derive.** It is denormalized from the
+    template's own source -- ``composition.is_abstract`` computes it -- and neither write input
+    carries it, because it is a fact about the source rather than something a caller decides.
+    Derive it on every write that touches a source field and store the answer, so the
+    ``is_abstract`` filter can be a column lookup instead of a full-store parse. A backend that
+    never sets it reports every template as concrete, and that filter quietly stops working.
+
+    A source whose composition tags are malformed has no answer: store ``False`` rather than
+    letting the syntax error out of the write. The flag is a search convenience, a template
+    nobody can parse cannot be extended either, and a write is the wrong place to report a
+    syntax error -- the edit boundary already refuses it, and ``compose`` reports it in full
+    at the point where it actually matters.
+    """
+
     @abstractmethod
     def create_template(self, data: ManagedTemplateCreateInput) -> ManagedTemplate:
         """
         Creates a new template in the backend.
+
+        Derive ``is_abstract`` from the source being stored -- see the class docstring.
 
         param data: ManagedTemplateCreateInput
         return: ManagedTemplate
@@ -50,6 +69,10 @@ class BaseTemplateManagerBackend(ABC):
         The new version starts in DRAFT whatever its predecessor's status was, so a copy
         nobody has reviewed is never published by the act of creating it. Fields left ``None``
         on the input -- tags included -- carry forward from the version copied.
+
+        ``is_abstract`` is re-derived from the new version's source rather than carried
+        forward: an edit that adds or removes a ``{% managed_children %}`` hole changes what
+        the template is.
 
         param template_key: str
         param data: ManagedTemplateCreateInput
@@ -277,7 +300,8 @@ class BaseTemplateManagerBackend(ABC):
         """
         Retrieves templates from the backend that match the given filters.
 
-        Every field of ``ManagedTemplateFilterFields`` tests an attribute of the row, with one
+        Every field of ``ManagedTemplateFilterFields`` tests an attribute of the row --
+        ``is_abstract`` included, which is why it is stored rather than parsed here -- with one
         exception: ``most_recent_active_version`` is about the *key*. ``True`` keeps only the
         highest-numbered version of each key whose status is in
         ``MOST_RECENT_ACTIVE_VERSION_STATUSES``, and ``False`` keeps every other row -- so an

@@ -42,6 +42,15 @@ class ManagedTemplate:
     # written before tags existed still constructs, and so a test building a template by hand
     # does not have to say "no tags" explicitly.
     tags: list[ManagedTemplateTag] = field(default_factory=list)
+    # Whether this is a base to build on rather than a template to send: it declares a
+    # ``{% managed_children %}`` hole, or declares blocks without extending anything.
+    #
+    # Denormalized, not authored. Nobody sets it on a write -- there is no field for it on
+    # either write input -- because it is a fact about the source, and a stored copy that
+    # disagreed with the source would be a lie a filter repeats. A backend derives it on every
+    # write with ``composition.is_abstract`` and stores the answer so a query can use it;
+    # ``composition.is_abstract`` recomputed is always the authority.
+    is_abstract: bool = field(default=False)
 
 
 @dataclass

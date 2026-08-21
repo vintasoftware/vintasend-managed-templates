@@ -22,6 +22,7 @@ from vintasend.services.notification_template_renderers.base_templated_email_ren
 )
 
 from vintasend_managed_templates.base_template_manager_backend import BaseTemplateManagerBackend
+from vintasend_managed_templates.composition import is_abstract
 from vintasend_managed_templates.constants import (
     MOST_RECENT_ACTIVE_VERSION_STATUSES,
     ManagedTemplateStatus,
@@ -35,6 +36,7 @@ from vintasend_managed_templates.dataclasses import (
     ManagedTemplateUpdateInput,
 )
 from vintasend_managed_templates.exceptions import (
+    ManagedTemplateCompositionError,
     ManagedTemplateInvalidTagError,
     ManagedTemplateNotFoundError,
     ManagedTemplateTagAlreadyExistsError,
@@ -108,6 +110,7 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
             tenant=input.tenant,
             tags=self.get_or_create_tags(input.tags or [], input.tenant),
         )
+        template = self._with_derived_flags(template)
         self.templates.append(template)
         return template
 
@@ -153,8 +156,28 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
                 else self.get_or_create_tags(input.tags, latest.tenant)
             ),
         )
+        new_version = self._with_derived_flags(new_version)
         self.templates.append(new_version)
         return new_version
+
+    @staticmethod
+    def _with_derived_flags(template: ManagedTemplate) -> ManagedTemplate:
+        """Fill in the fields a backend derives rather than stores as it was given them.
+
+        Just ``is_abstract`` so far. Doing it in one place, on the way into the store, is what
+        the seam asks of every backend: the flag is a denormalization of the source, so it is
+        recomputed by whatever writes the source and never carried forward from a previous
+        version.
+        """
+        try:
+            derived = is_abstract(template)
+        except ManagedTemplateCompositionError:
+            # A template whose tags are malformed has no answer, and a write is not the
+            # place to report a syntax error -- the flag is a search convenience, and a
+            # template nobody can parse cannot be extended either. Reads as concrete, which
+            # is the rule every backend in this project follows.
+            derived = False
+        return dataclasses.replace(template, is_abstract=derived)
 
     def delete_template(self, template_key: str, version: int | None = None) -> None:
         self.calls.append("delete_template")
@@ -381,6 +404,10 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
         return set(highest.items())
 
     def _matches_field(self, template: ManagedTemplate, field: str, spec) -> bool:
+        if field == "is_abstract":
+            # The stored flag, not a fresh parse: querying the denormalization is the whole
+            # point of having one, and a store whose flag has drifted should show that here.
+            return template.is_abstract is bool(spec)
         if field == "most_recent_active_version":
             # The one field that is about the key rather than the row, so it is answered
             # against the whole store instead of against an attribute of this template.

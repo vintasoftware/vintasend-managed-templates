@@ -21,10 +21,17 @@ What the service adds on top of the raw backend:
   so every implementation of the storage seam is handed the same slug for the same text, and
   text with nothing sluggable in it is rejected with ``ManagedTemplateInvalidTagError``
   instead of becoming a tag no filter can ever name.
-* **Version-pinned rendering.** ``ManagedTemplateRenderer.render`` resolves a key to whatever
-  version the backend hands back. The service instead fetches an explicit version and drives
-  the renderer's ``create_template_content`` / ``render_from_template_content`` pair directly,
-  which is what makes previewing an unpublished draft possible.
+* **Version-pinned rendering.** Both paths honour a notification's own
+  ``requested_template_version``, so a notification recorded against v3 renders v3 however many
+  versions follow. The service adds an explicit ``version`` argument on top, overriding even
+  that -- which is what makes previewing an unpublished draft possible -- and drives the
+  renderer's ``create_template_content`` / ``render_from_template_content`` pair directly. What
+  actually rendered comes back on the send input's ``template_version``, for the caller to
+  record.
+* **Composition.** Templates are flattened before they render: a template that extends a base
+  or includes a fragment reaches the engine as one string with no ``managed_*`` tag left in it
+  (see ``composition``). Reads are unaffected -- ``get_template`` still hands back exactly what
+  is stored, and ``get_composed_template`` is the explicit way to ask for the assembled form.
 
 Two deliberate non-policies, both chosen so the service stays a thin orchestration layer:
 
@@ -46,6 +53,7 @@ from typing import TYPE_CHECKING, ClassVar, Generic, TypeVar
 from vintasend.services.notification_template_renderers.base import NotificationSendInput
 
 from .base_template_manager_backend import BaseTemplateManagerBackend
+from .composition import TemplateComposer, TemplateReference
 from .constants import ManagedTemplateStatus, ManagedTemplateTagStatus
 from .dataclasses import (
     ManagedTemplate,
@@ -93,7 +101,7 @@ _KNOWN_FILTER_FIELDS: frozenset[str] = frozenset(ManagedTemplateFilterFields.__a
 _TAG_FILTER_FIELDS: frozenset[str] = frozenset({"includes_all_tags", "includes_any_of_tags"})
 
 # The filter fields whose value is a bare boolean.
-_FLAG_FILTER_FIELDS: frozenset[str] = frozenset({"most_recent_active_version"})
+_FLAG_FILTER_FIELDS: frozenset[str] = frozenset({"most_recent_active_version", "is_abstract"})
 
 
 def _current_versions_only() -> ManagedTemplateFilterFields:
@@ -119,11 +127,20 @@ class ManagedTemplateService(Generic[TemplateContentType]):
     :param validate_status_transitions: when True (the default), a status change must appear in
         ``ALLOWED_STATUS_TRANSITIONS`` for the version's current status. Set False to let any
         status move to any other and leave the ordering entirely to the host.
+    :param compose_templates: when True (the default), a template is flattened before it is
+        rendered -- ``{% managed_extends %}`` / ``{% managed_include %}`` and the rest are
+        resolved against this service's backend. Set False to hand the engine what is stored,
+        verbatim.
+    :param composer: the composer that does it. Defaults to one reading through
+        ``template_manager_backend``, so composition resolves against the same store the
+        service reads from rather than through whatever backend the renderer happens to hold.
     """
 
     template_manager_backend: BaseTemplateManagerBackend
     template_renderer: ManagedTemplateRenderer[TemplateContentType]
     validate_status_transitions: bool
+    compose_templates: bool
+    composer: TemplateComposer
 
     # Which status a version may move to, keyed by the status it is in now. Overridable on a
     # subclass for hosts with a different lifecycle. ARCHIVED is terminal: an archived version
@@ -149,10 +166,14 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         template_manager_backend: BaseTemplateManagerBackend,
         template_renderer: ManagedTemplateRenderer[TemplateContentType],
         validate_status_transitions: bool = True,
+        compose_templates: bool = True,
+        composer: TemplateComposer | None = None,
     ) -> None:
         self.template_manager_backend = template_manager_backend
         self.template_renderer = template_renderer
         self.validate_status_transitions = validate_status_transitions
+        self.compose_templates = compose_templates
+        self.composer = composer or TemplateComposer.from_backend(template_manager_backend)
 
     # ------------------------------------------------------------------
     # Versions
@@ -844,6 +865,101 @@ class ManagedTemplateService(Generic[TemplateContentType]):
             raise ValueError(f"page_size must be 1 or greater, got {page_size}.")
 
     # ------------------------------------------------------------------
+    # Composition
+    # ------------------------------------------------------------------
+
+    def compose_template(self, template: ManagedTemplate) -> ManagedTemplate:
+        """
+        Flattens a template's inheritance and inclusion into a single self-contained one.
+
+        Composition is what a store-backed template has instead of an engine loader: the
+        engine is handed source rather than a name, so a ``{% managed_extends %}`` here is
+        resolved against the backend before the engine ever sees the template. The result has
+        no ``managed_*`` tag left in it, and the engine's own syntax is untouched.
+
+        A no-op -- returning the very template it was given -- when the template composes to
+        itself, and when the service was built with ``compose_templates=False``.
+
+        param template: ManagedTemplate
+        return: ManagedTemplate
+        raises ManagedTemplateCompositionError: if the template cannot be assembled.
+        """
+        if not self.compose_templates:
+            return template
+        return self.composer.compose(template)
+
+    def get_composed_template(
+        self, template_key: str, version: int | None = None
+    ) -> ManagedTemplate:
+        """
+        Retrieves one version of a template, assembled as the engine will receive it.
+
+        The counterpart to ``get_template``, which is deliberately literal about what is
+        stored. Use this to preview what a template really renders, or to check that a base
+        someone just edited still assembles for the templates built on it.
+
+        param template_key: str
+        param version: int | None
+        return: ManagedTemplate
+        raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        raises ManagedTemplateCompositionError: if the template cannot be assembled.
+        """
+        return self.compose_template(self.get_template(template_key, version))
+
+    def validate_composition(self, template: ManagedTemplate) -> None:
+        """
+        Assembles a template and throws the result away, to surface any problem now.
+
+        What a form or a deploy check calls: it raises exactly what rendering would have
+        raised -- a malformed tag, a base that does not exist, a loop -- at a point where
+        someone can still fix it rather than at send time.
+
+        param template: ManagedTemplate
+        raises ManagedTemplateCompositionError: if the template cannot be assembled.
+        """
+        self.composer.validate(template)
+
+    def get_template_references(self, template: ManagedTemplate) -> list[TemplateReference]:
+        """
+        Lists the templates one template directly extends or includes.
+
+        Direct references only, and nothing is resolved, so this answers "what does this
+        template name" without needing any of them to exist. Follow the chain yourself when
+        the whole tree is what you are after.
+
+        param template: ManagedTemplate
+        return: list[TemplateReference]
+        raises ManagedTemplateCompositionSyntaxError: if a composition tag is malformed.
+        """
+        return self.composer.references(template)
+
+    def is_abstract(self, template: ManagedTemplate) -> bool:
+        """
+        Whether a template is a base to build on rather than one to send.
+
+        True when it declares a ``{% managed_children %}`` hole, or declares blocks without
+        extending anything. Read off the source every time it is asked, which makes it the
+        authority: ``template.is_abstract`` is a backend's stored copy of this answer, kept for
+        the ``is_abstract`` filter to query, and this is what that copy is supposed to say.
+        Check with this before trusting the flag on a template that has been edited in memory
+        since it was read.
+
+        To *find* the bases rather than test one, filter on the stored flag -- it is indexed
+        and this is not::
+
+            service.get_filtered_templates({"is_abstract": False})   # everything sendable
+
+        Neither one refuses anything: the service renders an abstract template quite happily,
+        and gives you the layout with an empty hole. Keeping bases out of a picker is the
+        host's call to make.
+
+        param template: ManagedTemplate
+        return: bool
+        raises ManagedTemplateCompositionSyntaxError: if a composition tag is malformed.
+        """
+        return self.composer.is_abstract(template)
+
+    # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
 
@@ -856,18 +972,25 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         """
         Renders a notification against a specific version of its template.
 
-        The notification's ``body_template`` is the template key. Passing ``version`` is what
-        separates this from ``ManagedTemplateRenderer.render``, which always resolves the key
-        to whatever version the backend considers current -- use this to preview an
-        unpublished draft, or to re-render an old notification against the version that was
-        live when it was sent.
+        The notification's ``body_template`` is the template key. Which version renders is
+        decided in this order: the ``version`` argument, then the notification's own
+        ``requested_template_version``, then whatever the backend considers current.
+
+        The argument is there to render a version the notification is *not* pinned to --
+        previewing an unpublished draft, or reproducing what an old notification looked like.
+        Leave it off and this renders what a real send would.
 
         param notification: Notification | OneOffNotification
         param context: NotificationContextDict
-        param version: int | None -- the latest version when None.
+        param version: int | None -- overrides the notification's own pin.
         return: NotificationSendInput
         raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        raises ManagedTemplateCompositionError: if the template cannot be assembled.
         """
+        if version is None:
+            # getattr rather than an attribute read: the field arrived in vintasend 2.1, and
+            # this service should keep working against a Notification that predates it.
+            version = getattr(notification, "requested_template_version", None)
         template = self.get_template(notification.body_template, version)
         return self.render_template(notification, template, context)
 
@@ -880,12 +1003,22 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         """
         Renders a notification against a template already in hand, with no backend read.
 
+        The template is composed first, so one already fetched and edited in memory renders
+        the same way a stored one does. The version it came from is reported back on the send
+        input, exactly as ``ManagedTemplateRenderer.render`` does, so a caller driving the
+        send themselves can still record which version went out.
+
         param notification: Notification | OneOffNotification
         param template: ManagedTemplate
         param context: NotificationContextDict
         return: NotificationSendInput
+        raises ManagedTemplateCompositionError: if the template cannot be assembled.
         """
-        template_content = self.template_renderer.create_template_content(template)
-        return self.template_renderer.render_from_template_content(
+        template_content = self.template_renderer.create_template_content(
+            self.compose_template(template)
+        )
+        send_input = self.template_renderer.render_from_template_content(
             notification, template_content, context
         )
+        send_input.template_version = template.version
+        return send_input
