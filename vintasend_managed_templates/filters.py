@@ -1,7 +1,19 @@
 import datetime
+import sys
 from decimal import Decimal
 from enum import Enum
-from typing import Generic, Literal, TypeAlias, TypedDict, TypeGuard, TypeVar
+from typing import Generic, Literal, TypeAlias, TypeGuard, TypeVar
+
+
+# Generic ``TypedDict`` (``class Foo(TypedDict, Generic[T])``) only became legal in 3.11;
+# on 3.10 ``typing.TypedDict`` raises ``TypeError: cannot inherit from both a TypedDict type
+# and a non-TypedDict base class`` at import time. ``typing_extensions`` is a hard runtime
+# dependency of vintasend, so the fallback is always importable. Use a ``sys.version_info``
+# guard rather than try/except ImportError so mypy evaluates the branch statically.
+if sys.version_info >= (3, 11):
+    from typing import TypedDict
+else:
+    from typing_extensions import TypedDict
 
 from .constants import ManagedTemplateStatus
 
@@ -49,6 +61,15 @@ StringMembershipFilter: TypeAlias = (
 )
 
 
+# A tag filter is a plain collection of tag slugs -- no lookup wrapper, because which of the
+# two matches is meant is already said by the field name (``includes_all_tags`` /
+# ``includes_any_of_tags``) rather than by a ``lookup`` key.
+#
+# Values are matched against ``ManagedTemplateTag.slug``. Backends slugify what they are given
+# first, so a caller may pass either the slug or the text it came from and get the same result.
+TagsFieldFilter: TypeAlias = list[str] | tuple[str, ...] | set[str]
+
+
 ChoiceType = TypeVar("ChoiceType", bound=Enum)
 
 
@@ -87,6 +108,12 @@ class ManagedTemplateFilterFields(TypedDict, total=False):
     status: ManagedTemplateStatusFilter
     created_at_range: DateRange
     updated_at_range: DateRange
+    # Tag membership. ``includes_all_tags`` matches a template carrying every listed tag,
+    # ``includes_any_of_tags`` one carrying at least one of them. Both follow Python's own
+    # ``all()`` / ``any()`` on an empty list: an empty ``includes_all_tags`` constrains
+    # nothing, an empty ``includes_any_of_tags`` matches nothing.
+    includes_all_tags: TagsFieldFilter
+    includes_any_of_tags: TagsFieldFilter
 
 
 # ``and`` / ``or`` / ``not`` are Python keywords, so these single-key groups can only be
@@ -97,7 +124,11 @@ NotFilter = TypedDict("NotFilter", {"not": "ManagedTemplateFilter"})
 
 
 FilterLookup: TypeAlias = (
-    StringFieldFilter | IntegerFieldFilter | ManagedTemplateStatusFilter | DateRange
+    StringFieldFilter
+    | IntegerFieldFilter
+    | ManagedTemplateStatusFilter
+    | DateRange
+    | TagsFieldFilter
 )
 
 ManagedTemplateFilter: TypeAlias = ManagedTemplateFilterFields | AndFilter | OrFilter | NotFilter
@@ -171,6 +202,16 @@ def is_string_membership_exact_lookup(value: dict) -> TypeGuard[StringMembership
         and value.get("lookup") == "exact"
         and isinstance(value["value"], str)
     )
+
+
+def is_tags_filter(value: object) -> TypeGuard["TagsFieldFilter"]:
+    """Return ``True`` if a value is a collection of tag slugs.
+
+    A bare ``str`` is deliberately rejected: ``{"includes_all_tags": "welcome"}`` would
+    otherwise iterate character by character and silently ask for the tags ``w``, ``e``, ``l``.
+    Pass a one-element list instead.
+    """
+    return isinstance(value, (list, tuple, set)) and all(isinstance(v, str) for v in value)
 
 
 def is_choice_in_filter_lookup(

@@ -22,14 +22,21 @@ from vintasend.services.notification_template_renderers.base_templated_email_ren
 )
 
 from vintasend_managed_templates.base_template_manager_backend import BaseTemplateManagerBackend
-from vintasend_managed_templates.constants import ManagedTemplateStatus
+from vintasend_managed_templates.constants import ManagedTemplateStatus, ManagedTemplateTagStatus
 from vintasend_managed_templates.dataclasses import (
     ManagedTemplate,
     ManagedTemplateCreateInput,
     ManagedTemplateStatusHistory,
+    ManagedTemplateTag,
     ManagedTemplateUpdateInput,
 )
-from vintasend_managed_templates.exceptions import ManagedTemplateNotFoundError
+from vintasend_managed_templates.exceptions import (
+    ManagedTemplateInvalidTagError,
+    ManagedTemplateNotFoundError,
+    ManagedTemplateTagAlreadyExistsError,
+    ManagedTemplateTagNotFoundError,
+)
+from vintasend_managed_templates.tags import next_available_slug, slugify_tag
 
 
 # Fixed epoch plus a per-write counter, so ``created`` / ``updated`` are deterministic and
@@ -52,6 +59,9 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
     def __init__(self) -> None:
         self.templates: list[ManagedTemplate] = []
         self.status_history: list[ManagedTemplateStatusHistory] = []
+        # slug -> tag. One shared pool; a template holds copies of the tags it carries, and
+        # ``_retag`` re-reads from here so a rename reaches every template at once.
+        self.tags: dict[str, ManagedTemplateTag] = {}
         # Every call the service makes, in order. Lets a test assert what was NOT called --
         # e.g. that a no-op status change never reached the backend.
         self.calls: list[str] = []
@@ -92,6 +102,7 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
             created=now,
             updated=now,
             tenant=input.tenant,
+            tags=self.get_or_create_tags(input.tags or [], input.tenant),
         )
         self.templates.append(template)
         return template
@@ -130,6 +141,13 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
             body_template=input.template_body or latest.body_template,
             subject_template=input.template_subject or latest.subject_template,
             preheader_template=input.template_preheader or latest.preheader_template,
+            # ``None`` carries the previous version's tags forward; ``[]`` clears them. A
+            # falsy-or would collapse those two, so this tests for None explicitly.
+            tags=(
+                list(latest.tags)
+                if input.tags is None
+                else self.get_or_create_tags(input.tags, latest.tenant)
+            ),
         )
         self.templates.append(new_version)
         return new_version
@@ -173,6 +191,136 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
             and (version is None or record.version == version)
         ]
 
+    # -- tags -------------------------------------------------------------
+
+    def _slug_or_raise(self, text: str) -> str:
+        slug = slugify_tag(text)
+        if not slug:
+            raise ManagedTemplateInvalidTagError(f"Tag text {text!r} cannot be slugified.")
+        return slug
+
+    def _find_tag(self, slug: str) -> ManagedTemplateTag:
+        tag = self.tags.get(slugify_tag(slug))
+        if tag is None:
+            raise ManagedTemplateTagNotFoundError(f"Tag '{slug}' does not exist.")
+        return tag
+
+    def _retag(self) -> None:
+        """Refresh the tag copies every template holds from the shared pool.
+
+        A real store joins, so a rename or a delete is visible through every template at once.
+        Copying tags onto the template rows means this fake has to do the propagation itself.
+        """
+        for index, template in enumerate(self.templates):
+            refreshed = [self.tags[tag.slug] for tag in template.tags if tag.slug in self.tags]
+            self.templates[index] = dataclasses.replace(template, tags=refreshed)
+
+    def get_or_create_tags(
+        self, texts: Iterable[str], tenant: str | None = None
+    ) -> list[ManagedTemplateTag]:
+        self.calls.append("get_or_create_tags")
+        resolved: list[ManagedTemplateTag] = []
+        for text in texts:
+            slug = self._slug_or_raise(text)
+            tag = self.tags.get(slug)
+            if tag is None:
+                tag = self._store_tag(text, slug, tenant)
+            if tag not in resolved:
+                resolved.append(tag)
+        return resolved
+
+    def _store_tag(self, text: str, slug: str, tenant: str | None) -> ManagedTemplateTag:
+        now = self._now()
+        tag = ManagedTemplateTag(
+            id=next(self._ids),
+            text=text,
+            slug=slug,
+            status=ManagedTemplateTagStatus.ACTIVE,
+            created=now,
+            updated=now,
+            tenant=tenant,
+        )
+        self.tags[slug] = tag
+        return tag
+
+    def create_tag(self, text: str, tenant: str | None = None) -> ManagedTemplateTag:
+        self.calls.append("create_tag")
+        slug = self._slug_or_raise(text)
+        if slug in self.tags:
+            raise ManagedTemplateTagAlreadyExistsError(f"Tag '{slug}' already exists.")
+        return self._store_tag(text, slug, tenant)
+
+    def get_tag(self, slug: str) -> ManagedTemplateTag:
+        self.calls.append("get_tag")
+        return self._find_tag(slug)
+
+    def update_tag(self, slug: str, text: str) -> ManagedTemplateTag:
+        self.calls.append("update_tag")
+        tag = self._find_tag(slug)
+        new_slug = next_available_slug(
+            self._slug_or_raise(text),
+            lambda candidate: candidate in self.tags and candidate != tag.slug,
+        )
+        del self.tags[tag.slug]
+        updated = dataclasses.replace(tag, text=text, slug=new_slug, updated=self._now())
+        self.tags[new_slug] = updated
+        # The templates still hold the old slug, so they are re-pointed before the refresh.
+        for index, template in enumerate(self.templates):
+            if any(t.slug == tag.slug for t in template.tags):
+                kept = [t for t in template.tags if t.slug != tag.slug]
+                self.templates[index] = dataclasses.replace(template, tags=[*kept, updated])
+        self._retag()
+        return updated
+
+    def set_tag_status(self, slug: str, status: ManagedTemplateTagStatus) -> ManagedTemplateTag:
+        self.calls.append("set_tag_status")
+        tag = self._find_tag(slug)
+        updated = dataclasses.replace(tag, status=status, updated=self._now())
+        self.tags[tag.slug] = updated
+        self._retag()
+        return updated
+
+    def delete_tag(self, slug: str) -> None:
+        self.calls.append("delete_tag")
+        tag = self._find_tag(slug)
+        del self.tags[tag.slug]
+        self._retag()
+
+    def get_tags(
+        self,
+        status: Iterable[ManagedTemplateTagStatus] | None = None,
+        search: str | None = None,
+        tenant: str | None = None,
+    ) -> list[ManagedTemplateTag]:
+        self.calls.append("get_tags")
+        wanted = set(status) if status is not None else None
+        needle = search.lower() if search else None
+        return [
+            tag
+            for tag in self.tags.values()
+            if (wanted is None or tag.status in wanted)
+            and (tenant is None or tag.tenant == tenant)
+            and (needle is None or needle in tag.text.lower() or needle in tag.slug.lower())
+        ]
+
+    def get_template_tags(
+        self, template_key: str, version: int | None = None
+    ) -> list[ManagedTemplateTag]:
+        self.calls.append("get_template_tags")
+        return list(self.get_template(template_key, version).tags)
+
+    def set_template_tags(
+        self, template_key: str, tags: Iterable[str], version: int | None = None
+    ) -> ManagedTemplate:
+        self.calls.append("set_template_tags")
+        target = self.get_template(template_key, version)
+        resolved = self.get_or_create_tags(tags, target.tenant)
+        updated = dataclasses.replace(target, tags=resolved, updated=self._now())
+        self.templates[self._index_of(target)] = updated
+        return updated
+
+    # -- template reads ---------------------------------------------------
+
     def get_all_templates(self) -> list[ManagedTemplate]:
         self.calls.append("get_all_templates")
         return list(self.templates)
@@ -215,6 +363,13 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
         return all(self._matches_field(template, field, spec) for field, spec in filters.items())
 
     def _matches_field(self, template: ManagedTemplate, field: str, spec) -> bool:
+        if field in ("includes_all_tags", "includes_any_of_tags"):
+            # Slugify what the caller passed so a filter may name a tag by its text.
+            wanted = {slugify_tag(tag) for tag in spec}
+            carried = {tag.slug for tag in template.tags}
+            if field == "includes_all_tags":
+                return wanted <= carried
+            return bool(wanted & carried)
         if field in _DATE_RANGE_FIELDS:
             value = getattr(template, _DATE_RANGE_FIELDS[field])
             lower, upper = spec.get("from"), spec.get("to")
@@ -293,6 +448,7 @@ def make_create_input(
     template_subject: str | None = "Hello {name}",
     template_preheader: str | None = None,
     tenant: str | None = None,
+    tags: list[str] | None = None,
 ) -> ManagedTemplateCreateInput:
     return ManagedTemplateCreateInput(
         name=name,
@@ -303,6 +459,7 @@ def make_create_input(
         template_subject=template_subject,
         template_preheader=template_preheader,
         tenant=tenant,
+        tags=tags,
     )
 
 
@@ -313,6 +470,7 @@ def make_update_input(
     template_body: str | None = None,
     template_subject: str | None = None,
     template_preheader: str | None = None,
+    tags: list[str] | None = None,
 ) -> ManagedTemplateUpdateInput:
     return ManagedTemplateUpdateInput(
         name=name,
@@ -320,6 +478,7 @@ def make_update_input(
         template_body=template_body,
         template_subject=template_subject,
         template_preheader=template_preheader,
+        tags=tags,
     )
 
 

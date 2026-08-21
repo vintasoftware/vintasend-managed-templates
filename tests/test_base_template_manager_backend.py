@@ -28,6 +28,15 @@ EXPECTED_ABSTRACT_METHODS = frozenset(
         "get_filtered_templates",
         "get_paginated_templates",
         "get_paginated_filtered_templates",
+        "get_or_create_tags",
+        "create_tag",
+        "get_tag",
+        "update_tag",
+        "set_tag_status",
+        "delete_tag",
+        "get_tags",
+        "get_template_tags",
+        "set_template_tags",
     }
 )
 
@@ -68,6 +77,13 @@ def test_the_in_memory_fake_implements_the_whole_contract():
         ("delete_template", "version"),
         ("get_template_status_history", "version"),
         ("create_template_status_update", "changed_by"),
+        ("get_or_create_tags", "tenant"),
+        ("create_tag", "tenant"),
+        ("get_tags", "status"),
+        ("get_tags", "search"),
+        ("get_tags", "tenant"),
+        ("get_template_tags", "version"),
+        ("set_template_tags", "version"),
     ],
 )
 def test_optional_arguments_keep_their_none_default(method_name, argument):

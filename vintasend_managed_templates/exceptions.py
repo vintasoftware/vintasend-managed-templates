@@ -26,3 +26,21 @@ class ManagedTemplateStatusTransitionError(ManagedTemplateError):
     """Raised when a status change is not allowed from the version's current status."""
 
     pass
+
+
+class ManagedTemplateTagNotFoundError(ManagedTemplateError):
+    """Raised when a ManagedTemplateTag is not found in the backend."""
+
+    pass
+
+
+class ManagedTemplateTagAlreadyExistsError(ManagedTemplateError):
+    """Raised when creating a tag whose text already slugs to an existing tag."""
+
+    pass
+
+
+class ManagedTemplateInvalidTagError(ManagedTemplateError):
+    """Raised when a tag's text is empty or has nothing that can be slugified."""
+
+    pass

@@ -19,11 +19,16 @@ include = [
 [tool.poetry.dependencies]
 # Pinned to the current vintasend line (2.0) so a freshly cloned package starts
 # with a correct, working pin against the seams this template's stubs subclass.
-vintasend = "^2.0.0"
+vintasend = { path = "../..", develop = true }
+# filters.py imports it directly for the py310 generic-TypedDict fallback. vintasend already
+# depends on it, but a direct import gets a direct declaration.
+typing-extensions = ">=4.10.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.3"
 pytest-asyncio = "^1.4.0"
+pytest-xdist = {version = "^3.8.0", extras=["psutil"]}
+tox = "^4.55.0"
 ruff = "^0.15.22"
 mypy = "^2.3.0"
 pytest-cov = "^7.1.0"

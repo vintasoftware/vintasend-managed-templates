@@ -17,6 +17,10 @@ What the service adds on top of the raw backend:
 * **Filter validation.** Filters are checked for shape and field names before they reach the
   backend, so a typo raises ``ManagedTemplateInvalidFilterError`` here instead of silently
   matching nothing (or blowing up) deep inside a backend's query translation.
+* **Tag hygiene.** Tag text is normalized and slugified here before it reaches the backend,
+  so every implementation of the storage seam is handed the same slug for the same text, and
+  text with nothing sluggable in it is rejected with ``ManagedTemplateInvalidTagError``
+  instead of becoming a tag no filter can ever name.
 * **Version-pinned rendering.** ``ManagedTemplateRenderer.render`` resolves a key to whatever
   version the backend hands back. The service instead fetches an explicit version and drives
   the renderer's ``create_template_content`` / ``render_from_template_content`` pair directly,
@@ -34,30 +38,35 @@ There is no AsyncIO twin, matching the seams it composes: ``BaseTemplateManagerB
 ``ManagedTemplateRenderer`` are both synchronous.
 """
 
+import dataclasses
 import logging
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, ClassVar, Generic
+from typing import TYPE_CHECKING, ClassVar, Generic, TypeVar
 
 from vintasend.services.notification_template_renderers.base import NotificationSendInput
 
 from .base_template_manager_backend import BaseTemplateManagerBackend
-from .constants import ManagedTemplateStatus
+from .constants import ManagedTemplateStatus, ManagedTemplateTagStatus
 from .dataclasses import (
     ManagedTemplate,
     ManagedTemplateCreateInput,
     ManagedTemplateStatusHistory,
+    ManagedTemplateTag,
     ManagedTemplateUpdateInput,
 )
 from .exceptions import (
     ManagedTemplateInvalidFilterError,
+    ManagedTemplateInvalidTagError,
     ManagedTemplateStatusTransitionError,
 )
 from .filters import (
     ManagedTemplateFilter,
     ManagedTemplateFilterFields,
     is_field_filter,
+    is_tags_filter,
 )
 from .managed_template_renderer import ManagedTemplateRenderer, TemplateContentType
+from .tags import normalize_tag_text, slugify_tag
 
 
 if TYPE_CHECKING:
@@ -71,9 +80,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# The two write inputs that carry tags. ``_with_clean_tags`` hands back whichever one it was
+# given, so the create path keeps returning a create input and the update path an update one.
+InputType = TypeVar("InputType", ManagedTemplateCreateInput, ManagedTemplateUpdateInput)
+
+
 # Read off the TypedDict rather than hand-listing the names, so adding a field to
 # ``ManagedTemplateFilterFields`` does not silently leave filter validation rejecting it.
 _KNOWN_FILTER_FIELDS: frozenset[str] = frozenset(ManagedTemplateFilterFields.__annotations__)
+
+# The filter fields whose value is a collection of tag slugs rather than a lookup dict.
+_TAG_FILTER_FIELDS: frozenset[str] = frozenset({"includes_all_tags", "includes_any_of_tags"})
 
 
 class ManagedTemplateService(Generic[TemplateContentType]):
@@ -132,10 +149,14 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         """
         Creates the first version of a new template.
 
+        Any tag text on the input that has no tag behind it yet becomes one, so a caller
+        never has to create tags before using them.
+
         param input: ManagedTemplateCreateInput
         return: ManagedTemplate
+        raises ManagedTemplateInvalidTagError: if a tag text has nothing that can be slugified.
         """
-        return self.template_manager_backend.create_template(input)
+        return self.template_manager_backend.create_template(self._with_clean_tags(input))
 
     def get_template(self, template_key: str, version: int | None = None) -> ManagedTemplate:
         """
@@ -160,12 +181,29 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         that has already been published -- the backend copies the latest version forward,
         applies the non-None fields of ``input``, and returns the new version.
 
+        Tags follow the same rule as every other field on the input: ``None`` carries the
+        previous version's tags forward, and an empty list means a version with none.
+
         param template_key: str
         param input: ManagedTemplateUpdateInput
         return: ManagedTemplate
         raises ManagedTemplateNotFoundError: if the key does not exist.
+        raises ManagedTemplateInvalidTagError: if a tag text has nothing that can be slugified.
         """
-        return self.template_manager_backend.update_template(template_key, input)
+        return self.template_manager_backend.update_template(
+            template_key, self._with_clean_tags(input)
+        )
+
+    def _with_clean_tags(self, input: InputType) -> "InputType":  # noqa: A002
+        """Return the input with its tag texts normalized, or unchanged when it carries none.
+
+        Cleaning here means a backend receives text it can slugify, and a caller hears about
+        an unusable tag before anything is written -- rather than after a template exists with
+        a tag nothing can name.
+        """
+        if input.tags is None:
+            return input
+        return dataclasses.replace(input, tags=self._clean_tag_texts(input.tags))
 
     def delete_template(self, template_key: str, version: int | None = None) -> None:
         """
@@ -341,6 +379,282 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         )
 
     # ------------------------------------------------------------------
+    # Tags
+    # ------------------------------------------------------------------
+
+    def create_tag(self, text: str, tenant: str | None = None) -> ManagedTemplateTag:
+        """
+        Creates a tag, failing if its text already slugs onto an existing one.
+
+        Tagging a template creates missing tags on its own, so this is for the case where a
+        tag is being defined ahead of any template using it -- and where a collision with an
+        existing tag is worth hearing about rather than silently resolving.
+
+        param text: str
+        param tenant: str | None
+        return: ManagedTemplateTag
+        raises ManagedTemplateInvalidTagError: if the text has nothing that can be slugified.
+        raises ManagedTemplateTagAlreadyExistsError: if a tag with that slug exists.
+        """
+        return self.template_manager_backend.create_tag(self._clean_tag_text(text), tenant)
+
+    def get_tag(self, slug: str) -> ManagedTemplateTag:
+        """
+        Retrieves one tag by slug, or by the text it was created from.
+
+        param slug: str
+        return: ManagedTemplateTag
+        raises ManagedTemplateTagNotFoundError: if no tag has that slug.
+        """
+        return self.template_manager_backend.get_tag(slug)
+
+    def get_tags(
+        self,
+        status: Iterable[ManagedTemplateTagStatus] | None = None,
+        search: str | None = None,
+        tenant: str | None = None,
+    ) -> list[ManagedTemplateTag]:
+        """
+        Retrieves tags, optionally narrowed by status, by a text search, or by tenant.
+
+        param status: Iterable[ManagedTemplateTagStatus] | None -- every status when None.
+        param search: str | None -- a case-insensitive substring of the text or the slug.
+        param tenant: str | None
+        return: list[ManagedTemplateTag]
+        """
+        return list(self.template_manager_backend.get_tags(status, search, tenant))
+
+    def get_active_tags(self, tenant: str | None = None) -> list[ManagedTemplateTag]:
+        """
+        Retrieves the tags still on offer -- what a tag picker should show.
+
+        param tenant: str | None
+        return: list[ManagedTemplateTag]
+        """
+        return self.get_tags(status=[ManagedTemplateTagStatus.ACTIVE], tenant=tenant)
+
+    def update_tag(self, slug: str, text: str) -> ManagedTemplateTag:
+        """
+        Renames a tag, regenerating its slug from the new text.
+
+        The templates carrying the tag keep it. The slug changes, though, so a saved filter
+        naming the old slug stops matching -- a rename is a change of identity, not a display
+        change.
+
+        param slug: str -- the tag's current slug.
+        param text: str -- the new text.
+        return: ManagedTemplateTag
+        raises ManagedTemplateTagNotFoundError: if no tag has that slug.
+        raises ManagedTemplateInvalidTagError: if the new text has nothing to slugify.
+        """
+        return self.template_manager_backend.update_tag(slug, self._clean_tag_text(text))
+
+    def archive_tag(self, slug: str) -> ManagedTemplateTag:
+        """
+        Retires a tag from the pickers without touching the templates carrying it.
+
+        Filtering by an archived tag keeps working, and ``restore_tag`` puts it back. Use
+        ``delete_tag`` when the label should be gone from the templates too.
+
+        param slug: str
+        return: ManagedTemplateTag
+        raises ManagedTemplateTagNotFoundError: if no tag has that slug.
+        """
+        return self.set_tag_status(slug, ManagedTemplateTagStatus.ARCHIVED)
+
+    def restore_tag(self, slug: str) -> ManagedTemplateTag:
+        """
+        Puts an archived tag back on offer.
+
+        Unlike an archived template version -- terminal, because reviving one would rewrite
+        what its audit trail says happened -- a tag carries no history to contradict, so
+        archiving one is reversible.
+
+        param slug: str
+        return: ManagedTemplateTag
+        raises ManagedTemplateTagNotFoundError: if no tag has that slug.
+        """
+        return self.set_tag_status(slug, ManagedTemplateTagStatus.ACTIVE)
+
+    def set_tag_status(self, slug: str, status: ManagedTemplateTagStatus) -> ManagedTemplateTag:
+        """
+        Moves a tag to ``status``.
+
+        param slug: str
+        param status: ManagedTemplateTagStatus
+        return: ManagedTemplateTag
+        raises ManagedTemplateTagNotFoundError: if no tag has that slug.
+        """
+        return self.template_manager_backend.set_tag_status(slug, status)
+
+    def delete_tag(self, slug: str) -> None:
+        """
+        Deletes a tag, removing it from every template carrying it.
+
+        param slug: str
+        raises ManagedTemplateTagNotFoundError: if no tag has that slug.
+        """
+        self.template_manager_backend.delete_tag(slug)
+
+    def get_or_create_tags(
+        self, texts: Iterable[str], tenant: str | None = None
+    ) -> list[ManagedTemplateTag]:
+        """
+        Resolves tag texts to tags, creating the ones that do not exist yet.
+
+        param texts: Iterable[str] -- tag texts (or slugs).
+        param tenant: str | None
+        return: list[ManagedTemplateTag]
+        raises ManagedTemplateInvalidTagError: if a text has nothing that can be slugified.
+        """
+        return self.template_manager_backend.get_or_create_tags(
+            self._clean_tag_texts(texts), tenant
+        )
+
+    def get_template_tags(
+        self, template_key: str, version: int | None = None
+    ) -> list[ManagedTemplateTag]:
+        """
+        Retrieves the tags on one version of a template, or on its latest version.
+
+        param template_key: str
+        param version: int | None
+        return: list[ManagedTemplateTag]
+        raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        """
+        return list(self.template_manager_backend.get_template_tags(template_key, version))
+
+    def set_template_tags(
+        self, template_key: str, tags: Iterable[str], version: int | None = None
+    ) -> ManagedTemplate:
+        """
+        Replaces the tags on one version of a template, creating any that do not exist.
+
+        Retagging edits the version in place instead of creating a new one: tags are how a
+        template is found, not part of what it renders, so relabelling should not spawn a
+        version and drop it back to DRAFT.
+
+        param template_key: str
+        param tags: Iterable[str] -- tag texts (or slugs). Empty clears the version's tags.
+        param version: int | None -- the latest version when None.
+        return: ManagedTemplate
+        raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        raises ManagedTemplateInvalidTagError: if a text has nothing that can be slugified.
+        """
+        return self.template_manager_backend.set_template_tags(
+            template_key, self._clean_tag_texts(tags), version
+        )
+
+    def add_template_tags(
+        self, template_key: str, tags: Iterable[str], version: int | None = None
+    ) -> ManagedTemplate:
+        """
+        Adds tags to a version, leaving the ones already on it in place.
+
+        param template_key: str
+        param tags: Iterable[str] -- tag texts (or slugs).
+        param version: int | None
+        return: ManagedTemplate
+        raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        raises ManagedTemplateInvalidTagError: if a text has nothing that can be slugified.
+        """
+        template = self.get_template(template_key, version)
+        existing = [tag.slug for tag in template.tags]
+        added = [slug for slug in self._slugs_for(tags) if slug not in existing]
+        if not added:
+            return template
+        return self.set_template_tags(template_key, existing + added, template.version)
+
+    def remove_template_tags(
+        self, template_key: str, tags: Iterable[str], version: int | None = None
+    ) -> ManagedTemplate:
+        """
+        Removes tags from a version. Tags it does not carry are ignored.
+
+        The tags themselves survive -- this unlinks them from one version, it does not delete
+        them. Removing a tag no version carries any more leaves it in the tag list, where
+        ``delete_tag`` or ``archive_tag`` can deal with it.
+
+        param template_key: str
+        param tags: Iterable[str] -- tag texts (or slugs).
+        param version: int | None
+        return: ManagedTemplate
+        raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        raises ManagedTemplateInvalidTagError: if a text has nothing that can be slugified.
+        """
+        template = self.get_template(template_key, version)
+        unwanted = set(self._slugs_for(tags))
+        remaining = [tag.slug for tag in template.tags if tag.slug not in unwanted]
+        if len(remaining) == len(template.tags):
+            return template
+        return self.set_template_tags(template_key, remaining, template.version)
+
+    def get_templates_by_tags(
+        self, tags: Iterable[str], match_all: bool = True
+    ) -> list[ManagedTemplate]:
+        """
+        Retrieves the templates carrying these tags -- all of them, or any of them.
+
+        A shorthand for the ``includes_all_tags`` / ``includes_any_of_tags`` filters, which
+        is what it builds. Follows the same empty-collection rule they do: matching *all* of
+        no tags returns everything, matching *any* of no tags returns nothing.
+
+        param tags: Iterable[str] -- tag texts (or slugs).
+        param match_all: bool -- every tag when True (the default), at least one when False.
+        return: list[ManagedTemplate]
+        """
+        # The two branches are spelled out rather than built from a variable key: a dict
+        # keyed by a `str` variable does not narrow to the filter TypedDict, and writing the
+        # literals keeps the call type-checked instead of casting the check away.
+        slugs = self._slugs_for(tags)
+        filters: ManagedTemplateFilter = (
+            {"includes_all_tags": slugs} if match_all else {"includes_any_of_tags": slugs}
+        )
+        return self.get_filtered_templates(filters)
+
+    def _clean_tag_text(self, text: str) -> str:
+        """Trim a tag's text, rejecting it when nothing sluggable is left.
+
+        Checked here rather than left to the backend so every backend is handed text it can
+        slugify, and so a caller hears about ``"  "`` or ``"!!!"`` at the call site instead of
+        ending up with a tag whose slug is empty and which no filter can name.
+        """
+        cleaned = normalize_tag_text(text)
+        if not cleaned or not slugify_tag(cleaned):
+            raise ManagedTemplateInvalidTagError(
+                f"Tag text {text!r} has no characters that can be turned into a slug."
+            )
+        return cleaned
+
+    def _clean_tag_texts(self, texts: Iterable[str]) -> list[str]:
+        """Clean each text, dropping repeats that slug onto a tag already in the list."""
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for text in texts:
+            candidate = self._clean_tag_text(text)
+            slug = slugify_tag(candidate)
+            if slug in seen:
+                continue
+            seen.add(slug)
+            cleaned.append(candidate)
+        return cleaned
+
+    @staticmethod
+    def _slugs_for(tags: Iterable[str]) -> list[str]:
+        """Slugify a caller's tag texts, dropping the ones with nothing sluggable.
+
+        Unlike ``_clean_tag_texts`` this never raises: these slugs are used to *match*, and a
+        tag no store could hold simply matches nothing -- which is a correct answer, not an
+        error worth interrupting a search for.
+        """
+        slugs: list[str] = []
+        for tag in tags:
+            slug = slugify_tag(tag)
+            if slug and slug not in slugs:
+                slugs.append(slug)
+        return slugs
+
+    # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
 
@@ -425,6 +739,7 @@ class ManagedTemplateService(Generic[TemplateContentType]):
                 raise ManagedTemplateInvalidFilterError(
                     f"{_path} names unknown field(s): {', '.join(unknown)}. Known fields: {known}."
                 )
+            self._validate_tag_fields(filters, _path)
             return
 
         # A logical group is exactly one of and/or/not, and nothing else. Allowing siblings
@@ -451,6 +766,23 @@ class ManagedTemplateService(Generic[TemplateContentType]):
             raise ManagedTemplateInvalidFilterError(f"{_path}.{key} must not be empty.")
         for index, sub_filter in enumerate(value):
             self.validate_filter(sub_filter, f"{_path}.{key}[{index}]")
+
+    def _validate_tag_fields(self, filters: ManagedTemplateFilterFields, _path: str) -> None:
+        """Reject a tag filter that is not a collection of strings.
+
+        The one value check ``validate_filter`` does make, because the failure it prevents is
+        silent rather than loud: a bare ``"welcome"`` is iterable, so a backend would happily
+        ask for the tags ``w``, ``e``, ``l``, ``c`` and return nothing, with no error anywhere.
+        """
+        for field in _TAG_FILTER_FIELDS:
+            if field not in filters:
+                continue
+            value = filters[field]  # type: ignore[literal-required]
+            if not is_tags_filter(value):
+                raise ManagedTemplateInvalidFilterError(
+                    f"{_path}.{field} must be a list of tag slugs, got "
+                    f"{type(value).__name__}. Wrap a single tag in a list."
+                )
 
     def _validate_pagination(self, page: int, page_size: int) -> None:
         if page < 1:

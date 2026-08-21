@@ -11,6 +11,11 @@ __pycache__/
 
 # coverage result
 .coverage
+.coverage.*
+coverage.xml
+coverage-*.xml
+coverage.json
+htmlcov/
 /coverage/
 
 # pycharm
@@ -48,3 +53,5 @@ tmp_email/
 
 # built files
 dist/
+# tox build/test environments
+.tox/

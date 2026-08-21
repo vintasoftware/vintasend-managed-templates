@@ -137,7 +137,20 @@ def test_update_input_carries_only_the_editable_fields():
         "template_body",
         "template_subject",
         "template_preheader",
+        "tags",
     ]
+
+
+def test_update_input_defaults_tags_to_none_meaning_carry_forward():
+    payload = ManagedTemplateUpdateInput(
+        name=None,
+        description=None,
+        template_body=None,
+        template_subject=None,
+        template_preheader=None,
+    )
+
+    assert payload.tags is None
 
 
 # ----------------------------------------------------------------------

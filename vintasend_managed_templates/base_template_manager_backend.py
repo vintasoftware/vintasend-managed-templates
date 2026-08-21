@@ -1,11 +1,12 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 
-from .constants import ManagedTemplateStatus
+from .constants import ManagedTemplateStatus, ManagedTemplateTagStatus
 from .dataclasses import (
     ManagedTemplate,
     ManagedTemplateCreateInput,
     ManagedTemplateStatusHistory,
+    ManagedTemplateTag,
     ManagedTemplateUpdateInput,
 )
 from .filters import ManagedTemplateFilter
@@ -84,6 +85,160 @@ class BaseTemplateManagerBackend(ABC):
         param template_key: str
         param version: int | None
         return: Iterable[ManagedTemplateStatusHistory]
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # Tags
+    # ------------------------------------------------------------------
+    #
+    # Tags are many-to-many with template versions and are identified by their slug, which
+    # the backend derives from the text with ``vintasend_managed_templates.tags.slugify_tag``
+    # and keeps unique across the store -- appending ``-2``, ``-3`` and so on when a distinct
+    # text slugs onto a taken slug. Every method below that takes a slug accepts the original
+    # text too: implementations slugify what they are given before looking it up.
+
+    @abstractmethod
+    def get_or_create_tags(
+        self, texts: Iterable[str], tenant: str | None = None
+    ) -> list[ManagedTemplateTag]:
+        """
+        Resolves tag texts to tags, creating the ones that do not exist yet.
+
+        This is the on-the-fly path every tagging call goes through: a caller tags a template
+        with what a person typed and never has to check first whether that tag exists. Texts
+        that slugify onto an existing tag resolve to it rather than creating a duplicate, and
+        an existing tag is returned as it stands -- its text and status are left alone, so
+        re-using an ARCHIVED tag does not quietly bring it back.
+
+        param texts: Iterable[str] -- tag texts (or slugs).
+        param tenant: str | None
+        return: list[ManagedTemplateTag] -- one per distinct text, in the order given.
+        raises ManagedTemplateInvalidTagError: if a text has nothing that can be slugified.
+        """
+        ...
+
+    @abstractmethod
+    def create_tag(self, text: str, tenant: str | None = None) -> ManagedTemplateTag:
+        """
+        Creates a tag, failing if its text already slugs onto an existing one.
+
+        Use ``get_or_create_tags`` when a duplicate should resolve to the existing tag; this
+        is the explicit-create path, where a collision is worth reporting to the caller.
+
+        param text: str
+        param tenant: str | None
+        return: ManagedTemplateTag
+        raises ManagedTemplateTagAlreadyExistsError: if a tag with that slug exists.
+        raises ManagedTemplateInvalidTagError: if the text has nothing that can be slugified.
+        """
+        ...
+
+    @abstractmethod
+    def get_tag(self, slug: str) -> ManagedTemplateTag:
+        """
+        Retrieves one tag by slug (or by the text it was created from).
+
+        param slug: str
+        return: ManagedTemplateTag
+        raises ManagedTemplateTagNotFoundError: if no tag has that slug.
+        """
+        ...
+
+    @abstractmethod
+    def update_tag(self, slug: str, text: str) -> ManagedTemplateTag:
+        """
+        Renames a tag, regenerating its slug from the new text.
+
+        The slug changes, so anything holding the old one -- a bookmarked filter, a cached
+        query -- stops matching. The tag keeps its identity and its templates: only the
+        strings change.
+
+        param slug: str -- the tag's current slug.
+        param text: str -- the new text.
+        return: ManagedTemplateTag -- with its regenerated, unique slug.
+        raises ManagedTemplateTagNotFoundError: if no tag has that slug.
+        raises ManagedTemplateInvalidTagError: if the new text has nothing to slugify.
+        """
+        ...
+
+    @abstractmethod
+    def set_tag_status(self, slug: str, status: ManagedTemplateTagStatus) -> ManagedTemplateTag:
+        """
+        Archives a tag, or brings an archived one back.
+
+        Archiving keeps every link to a template: filtering by an archived tag still returns
+        the templates carrying it. What archiving is for is dropping the tag out of the
+        pickers a UI builds from the ACTIVE list.
+
+        param slug: str
+        param status: ManagedTemplateTagStatus
+        return: ManagedTemplateTag
+        raises ManagedTemplateTagNotFoundError: if no tag has that slug.
+        """
+        ...
+
+    @abstractmethod
+    def delete_tag(self, slug: str) -> None:
+        """
+        Deletes a tag and removes it from every template carrying it.
+
+        Unlike archiving, this is not reversible and the templates lose the label. Archive
+        instead when the tag should stop being offered but the history should stand.
+
+        param slug: str
+        raises ManagedTemplateTagNotFoundError: if no tag has that slug.
+        """
+        ...
+
+    @abstractmethod
+    def get_tags(
+        self,
+        status: Iterable[ManagedTemplateTagStatus] | None = None,
+        search: str | None = None,
+        tenant: str | None = None,
+    ) -> Iterable[ManagedTemplateTag]:
+        """
+        Retrieves tags, optionally narrowed by status, by a text search, or by tenant.
+
+        param status: Iterable[ManagedTemplateTagStatus] | None -- every status when None.
+        param search: str | None -- a case-insensitive substring of the text or the slug.
+        param tenant: str | None -- every tenant when None.
+        return: Iterable[ManagedTemplateTag]
+        """
+        ...
+
+    @abstractmethod
+    def get_template_tags(
+        self, template_key: str, version: int | None = None
+    ) -> Iterable[ManagedTemplateTag]:
+        """
+        Retrieves the tags on one version of a template, or on its latest version.
+
+        param template_key: str
+        param version: int | None
+        return: Iterable[ManagedTemplateTag]
+        raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def set_template_tags(
+        self, template_key: str, tags: Iterable[str], version: int | None = None
+    ) -> ManagedTemplate:
+        """
+        Replaces the tags on one version of a template, creating any that do not exist.
+
+        This edits a version in place rather than creating a new one, which is the one thing
+        about a template that does: tags are search metadata, not template content, so
+        retagging for findability should not spawn a version and reset it to DRAFT.
+
+        param template_key: str
+        param tags: Iterable[str] -- tag texts (or slugs). Empty clears the version's tags.
+        param version: int | None -- the latest version when None.
+        return: ManagedTemplate -- the version with its new tags.
+        raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        raises ManagedTemplateInvalidTagError: if a text has nothing that can be slugified.
         """
         ...
 
