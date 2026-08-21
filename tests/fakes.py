@@ -22,7 +22,11 @@ from vintasend.services.notification_template_renderers.base_templated_email_ren
 )
 
 from vintasend_managed_templates.base_template_manager_backend import BaseTemplateManagerBackend
-from vintasend_managed_templates.constants import ManagedTemplateStatus, ManagedTemplateTagStatus
+from vintasend_managed_templates.constants import (
+    MOST_RECENT_ACTIVE_VERSION_STATUSES,
+    ManagedTemplateStatus,
+    ManagedTemplateTagStatus,
+)
 from vintasend_managed_templates.dataclasses import (
     ManagedTemplate,
     ManagedTemplateCreateInput,
@@ -362,7 +366,26 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
             return not self._matches(template, filters["not"])
         return all(self._matches_field(template, field, spec) for field, spec in filters.items())
 
+    def _current_versions(self) -> set[tuple[str, int]]:
+        """``(key, version)`` of the highest ACTIVE-or-DRAFT version of each key.
+
+        Recomputed per call rather than cached: every write goes straight into
+        ``self.templates``, so a cache here would answer with the store as it was.
+        """
+        highest: dict[str, int] = {}
+        for template in self.templates:
+            if template.status not in MOST_RECENT_ACTIVE_VERSION_STATUSES:
+                continue
+            if template.version > highest.get(template.key, 0):
+                highest[template.key] = template.version
+        return set(highest.items())
+
     def _matches_field(self, template: ManagedTemplate, field: str, spec) -> bool:
+        if field == "most_recent_active_version":
+            # The one field that is about the key rather than the row, so it is answered
+            # against the whole store instead of against an attribute of this template.
+            is_current = (template.key, template.version) in self._current_versions()
+            return is_current is bool(spec)
         if field in ("includes_all_tags", "includes_any_of_tags"):
             # Slugify what the caller passed so a filter may name a tag by its text.
             wanted = {slugify_tag(tag) for tag in spec}

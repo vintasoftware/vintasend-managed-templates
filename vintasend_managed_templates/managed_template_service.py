@@ -92,6 +92,19 @@ _KNOWN_FILTER_FIELDS: frozenset[str] = frozenset(ManagedTemplateFilterFields.__a
 # The filter fields whose value is a collection of tag slugs rather than a lookup dict.
 _TAG_FILTER_FIELDS: frozenset[str] = frozenset({"includes_all_tags", "includes_any_of_tags"})
 
+# The filter fields whose value is a bare boolean.
+_FLAG_FILTER_FIELDS: frozenset[str] = frozenset({"most_recent_active_version"})
+
+
+def _current_versions_only() -> ManagedTemplateFilterFields:
+    """The filter a listing applies unless it was asked for every version: one row per key.
+
+    Built per call rather than shared, so a backend that keeps the filter it was handed --
+    or a caller that reads it off a fake and edits it -- cannot change what the next listing
+    means.
+    """
+    return {"most_recent_active_version": True}
+
 
 class ManagedTemplateService(Generic[TemplateContentType]):
     """
@@ -658,13 +671,26 @@ class ManagedTemplateService(Generic[TemplateContentType]):
     # Queries
     # ------------------------------------------------------------------
 
-    def get_all_templates(self) -> list[ManagedTemplate]:
+    def get_all_templates(self, include_all_versions: bool = False) -> list[ManagedTemplate]:
         """
-        Retrieves every version of every template.
+        Retrieves the current version of every template -- one row per key.
 
+        "Current" is the ``most_recent_active_version`` filter: the highest-numbered ACTIVE or
+        DRAFT version of each key. It is the default because a listing is nearly always a list
+        of *templates*, and the store holds a row per *version*, so the unfiltered read shows
+        the same template once per version it has ever had and hides the current one among its
+        own history.
+
+        Pass ``include_all_versions=True`` for the raw read -- every version of every key, in
+        whatever order the backend keeps them. ``get_template_versions`` is the narrower way to
+        ask the same question about one key.
+
+        param include_all_versions: bool -- every version rather than the current one per key.
         return: list[ManagedTemplate]
         """
-        return list(self.template_manager_backend.get_all_templates())
+        if include_all_versions:
+            return list(self.template_manager_backend.get_all_templates())
+        return self.get_filtered_templates(_current_versions_only())
 
     def get_filtered_templates(self, filters: ManagedTemplateFilter) -> list[ManagedTemplate]:
         """
@@ -678,17 +704,26 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         self.validate_filter(filters)
         return list(self.template_manager_backend.get_filtered_templates(filters))
 
-    def get_paginated_templates(self, page: int, page_size: int) -> list[ManagedTemplate]:
+    def get_paginated_templates(
+        self, page: int, page_size: int, include_all_versions: bool = False
+    ) -> list[ManagedTemplate]:
         """
-        Retrieves one page of templates.
+        Retrieves one page of templates, one row per key by default.
+
+        Pages the same set ``get_all_templates`` lists, and defaults the same way and for the
+        same reason: the current version of each key, unless ``include_all_versions`` asks for
+        every version.
 
         param page: int -- 1-indexed.
         param page_size: int
+        param include_all_versions: bool -- every version rather than the current one per key.
         return: list[ManagedTemplate]
         raises ValueError: if ``page`` or ``page_size`` is below 1.
         """
         self._validate_pagination(page, page_size)
-        return list(self.template_manager_backend.get_paginated_templates(page, page_size))
+        if include_all_versions:
+            return list(self.template_manager_backend.get_paginated_templates(page, page_size))
+        return self.get_paginated_filtered_templates(_current_versions_only(), page, page_size)
 
     def get_paginated_filtered_templates(
         self,
@@ -740,6 +775,7 @@ class ManagedTemplateService(Generic[TemplateContentType]):
                     f"{_path} names unknown field(s): {', '.join(unknown)}. Known fields: {known}."
                 )
             self._validate_tag_fields(filters, _path)
+            self._validate_flag_fields(filters, _path)
             return
 
         # A logical group is exactly one of and/or/not, and nothing else. Allowing siblings
@@ -782,6 +818,23 @@ class ManagedTemplateService(Generic[TemplateContentType]):
                 raise ManagedTemplateInvalidFilterError(
                     f"{_path}.{field} must be a list of tag slugs, got "
                     f"{type(value).__name__}. Wrap a single tag in a list."
+                )
+
+    def _validate_flag_fields(self, filters: ManagedTemplateFilterFields, _path: str) -> None:
+        """Reject a flag filter whose value is not a boolean.
+
+        Checked for the same reason the tag fields are: the failure is silent otherwise. A
+        backend reads a flag for its truthiness, so the string ``"false"`` -- what a query
+        parameter that skipped parsing arrives as -- would ask for exactly what the caller
+        meant to switch off.
+        """
+        for field in _FLAG_FILTER_FIELDS:
+            if field not in filters:
+                continue
+            value = filters[field]  # type: ignore[literal-required]
+            if not isinstance(value, bool):
+                raise ManagedTemplateInvalidFilterError(
+                    f"{_path}.{field} must be a boolean, got {type(value).__name__}."
                 )
 
     def _validate_pagination(self, page: int, page_size: int) -> None:

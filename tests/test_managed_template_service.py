@@ -394,11 +394,28 @@ def test_a_status_missing_from_the_table_allows_nothing(service, welcome):
 # ----------------------------------------------------------------------
 
 
-def test_get_all_templates_returns_every_version_of_every_key(service, welcome):
+def test_get_all_templates_lists_one_row_per_key(service, welcome):
     service.update_template("welcome", make_update_input(template_body="v2"))
     service.create_template(make_create_input("receipt"))
 
-    assert len(service.get_all_templates()) == 3
+    listed = service.get_all_templates()
+
+    assert [(t.key, t.version) for t in listed] == [("welcome", 2), ("receipt", 1)]
+
+
+def test_get_all_templates_can_be_asked_for_every_version(service, welcome):
+    service.update_template("welcome", make_update_input(template_body="v2"))
+    service.create_template(make_create_input("receipt"))
+
+    assert len(service.get_all_templates(include_all_versions=True)) == 3
+
+
+def test_get_all_templates_drops_a_key_with_no_active_or_draft_version(service, welcome):
+    service.set_status("welcome", ARCHIVED, version=1)
+    service.create_template(make_create_input("receipt"))
+
+    assert [t.key for t in service.get_all_templates()] == ["receipt"]
+    assert len(service.get_all_templates(include_all_versions=True)) == 2
 
 
 def test_get_all_templates_is_empty_on_a_fresh_backend(service):
@@ -467,6 +484,73 @@ def test_get_paginated_templates_slices_the_result(service, welcome):
 
 def test_get_paginated_templates_past_the_end_is_empty(service, welcome):
     assert service.get_paginated_templates(9, 10) == []
+
+
+def test_get_paginated_templates_pages_one_row_per_key(service, welcome):
+    service.update_template("welcome", make_update_input(template_body="v2"))
+    service.create_template(make_create_input("receipt"))
+
+    paged = service.get_paginated_templates(1, 10)
+
+    assert [(t.key, t.version) for t in paged] == [("welcome", 2), ("receipt", 1)]
+
+
+def test_get_paginated_templates_can_be_asked_for_every_version(service, welcome):
+    service.update_template("welcome", make_update_input(template_body="v2"))
+
+    paged = service.get_paginated_templates(1, 10, include_all_versions=True)
+
+    assert [(t.key, t.version) for t in paged] == [("welcome", 1), ("welcome", 2)]
+
+
+# ----------------------------------------------------------------------
+# most_recent_active_version
+# ----------------------------------------------------------------------
+
+
+def test_most_recent_active_version_keeps_the_highest_active_or_draft_version(service, welcome):
+    service.set_status("welcome", ACTIVE, version=1)
+    service.update_template("welcome", make_update_input(template_body="v2"))
+
+    matched = service.get_filtered_templates({"most_recent_active_version": True})
+
+    assert [(t.key, t.version, t.status) for t in matched] == [("welcome", 2, DRAFT)]
+
+
+def test_most_recent_active_version_skips_a_retired_higher_version(service, welcome):
+    service.set_status("welcome", ACTIVE, version=1)
+    service.update_template("welcome", make_update_input(template_body="v2"))
+    service.set_status("welcome", ARCHIVED, version=2)
+
+    matched = service.get_filtered_templates({"most_recent_active_version": True})
+
+    assert [(t.version, t.status) for t in matched] == [(1, ACTIVE)]
+
+
+def test_most_recent_active_version_false_is_the_complement(service, welcome):
+    service.update_template("welcome", make_update_input(template_body="v2"))
+    service.set_status("welcome", ARCHIVED, version=1)
+
+    current = service.get_filtered_templates({"most_recent_active_version": True})
+    rest = service.get_filtered_templates({"most_recent_active_version": False})
+
+    assert [t.version for t in current] == [2]
+    assert [t.version for t in rest] == [1]
+
+
+def test_most_recent_active_version_combines_with_other_fields(service, welcome):
+    service.create_template(make_create_input("receipt"))
+    service.update_template("receipt", make_update_input(template_body="v2"))
+
+    matched = service.get_filtered_templates({"most_recent_active_version": True, "key": "receipt"})
+
+    assert [(t.key, t.version) for t in matched] == [("receipt", 2)]
+
+
+@pytest.mark.parametrize("value", ["true", 1, None, ["yes"]])
+def test_a_non_boolean_most_recent_active_version_is_rejected(service, value):
+    with pytest.raises(ManagedTemplateInvalidFilterError, match="must be a boolean"):
+        service.get_filtered_templates({"most_recent_active_version": value})
 
 
 def test_get_paginated_filtered_templates_filters_then_pages(service, welcome):

@@ -42,9 +42,18 @@ class BaseTemplateManagerBackend(ABC):
         """
         Creates a new version of an existing template in the backend.
 
+        A new version is a new row, and the version it was copied from is left exactly as it
+        was -- content, status and history. That is what versioning is for: a notification
+        that already went out against v1 renders v1 forever, however many versions follow it,
+        and several versions of one key are live at the same time as a matter of course.
+
+        The new version starts in DRAFT whatever its predecessor's status was, so a copy
+        nobody has reviewed is never published by the act of creating it. Fields left ``None``
+        on the input -- tags included -- carry forward from the version copied.
+
         param template_key: str
         param data: ManagedTemplateCreateInput
-        return: ManagedTemplate
+        return: ManagedTemplate -- the new version.
         """
         ...
 
@@ -267,6 +276,14 @@ class BaseTemplateManagerBackend(ABC):
     def get_filtered_templates(self, filters: ManagedTemplateFilter) -> Iterable[ManagedTemplate]:
         """
         Retrieves templates from the backend that match the given filters.
+
+        Every field of ``ManagedTemplateFilterFields`` tests an attribute of the row, with one
+        exception: ``most_recent_active_version`` is about the *key*. ``True`` keeps only the
+        highest-numbered version of each key whose status is in
+        ``MOST_RECENT_ACTIVE_VERSION_STATUSES``, and ``False`` keeps every other row -- so an
+        implementation answers it by comparing the row against its key's other versions rather
+        than by reading a column. It is what the service's listing methods apply by default, so
+        a backend that cannot evaluate it cannot serve a default listing.
 
         param filters: dict
         return: Iterable[ManagedTemplate]

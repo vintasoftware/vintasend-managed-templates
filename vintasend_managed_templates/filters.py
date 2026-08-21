@@ -70,6 +70,11 @@ StringMembershipFilter: TypeAlias = (
 TagsFieldFilter: TypeAlias = list[str] | tuple[str, ...] | set[str]
 
 
+# A flag field takes the bare boolean and nothing else: there is no lookup to choose, since
+# the only two questions it can answer are "yes" and "no".
+BooleanFieldFilter: TypeAlias = bool
+
+
 ChoiceType = TypeVar("ChoiceType", bound=Enum)
 
 
@@ -114,6 +119,15 @@ class ManagedTemplateFilterFields(TypedDict, total=False):
     # nothing, an empty ``includes_any_of_tags`` matches nothing.
     includes_all_tags: TagsFieldFilter
     includes_any_of_tags: TagsFieldFilter
+    # One row per key instead of one row per version. ``True`` keeps, for each key, only the
+    # highest-numbered version whose status is in
+    # ``MOST_RECENT_ACTIVE_VERSION_STATUSES`` (ACTIVE or DRAFT), and drops every key with no
+    # such version. ``False`` is its exact complement -- every other row, retired keys
+    # included -- so it is what ``{"not": {"most_recent_active_version": True}}`` means.
+    #
+    # This is the one field whose answer depends on the *other* rows in the store rather than
+    # on the row being tested, so a backend evaluates it against the whole key, not the row.
+    most_recent_active_version: BooleanFieldFilter
 
 
 # ``and`` / ``or`` / ``not`` are Python keywords, so these single-key groups can only be
@@ -129,6 +143,7 @@ FilterLookup: TypeAlias = (
     | ManagedTemplateStatusFilter
     | DateRange
     | TagsFieldFilter
+    | BooleanFieldFilter
 )
 
 ManagedTemplateFilter: TypeAlias = ManagedTemplateFilterFields | AndFilter | OrFilter | NotFilter

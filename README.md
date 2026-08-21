@@ -1,275 +1,323 @@
-# vintasend-templates-manager
+# vintasend-managed-templates
 
-A starting point for a new `vintasend-*` implementation package: one `TODO` stub per
-implementable seam (backend, adapter, template renderer, queue service, attachment manager),
-plus a matching scaffold test for each, so a fresh clone installs, type-checks, and passes its
-test suite before you write a single line of real logic.
+Database-backed notification templates for
+[vintasend](https://github.com/vintasoftware/vintasend): versioning, a
+draft/active/inactive/archived lifecycle with an audit trail, tags, and filtering — all on top of
+a storage seam you (or a ready-made package) implement.
 
-This package is not published and does nothing useful on its own — every stub raises
-`NotImplementedError("TODO: ...")`. Clone it, rename it, then replace each `TODO` with a real
-implementation.
+A regular vintasend template renderer reads templates from wherever its engine looks, which is
+usually files on disk. That means every copy change is a deploy. This package moves the templates
+into a data store so someone who is not a developer can edit them, keeps every edit as a new
+version, and lets you publish a version deliberately instead of the moment it is saved.
 
-## What's here
+It is storage-agnostic on its own — it defines the interface, not the database. Pair it with a
+manager backend such as
+[vintasend-django-templates-manager](https://github.com/vintasoftware/vintasend-django-templates-manager/),
+or implement `BaseTemplateManagerBackend` yourself.
 
-| File | Seam | Base class(es) |
-|---|---|---|
-| `vintasend_templates_manager/backend.py` | Storage | `BaseNotificationBackend`, `AsyncIOBaseNotificationBackend` |
-| `vintasend_templates_manager/adapter.py` | Delivery | `BaseNotificationAdapter`, `AsyncIOBaseNotificationAdapter`, `BackgroundNotificationAdapter`, `AsyncIOBackgroundNotificationAdapter` |
-| `vintasend_templates_manager/template_renderer.py` | Rendering | `BaseNotificationTemplateRenderer`, `BaseTemplatedEmailRenderer`, `BaseTemplatedSMSRenderer` |
-| `vintasend_templates_manager/queue_service.py` | Background send | `BaseNotificationQueueService`, `AsyncIOBaseNotificationQueueService` |
-| `vintasend_templates_manager/attachment_manager.py` | Attachment storage | `BaseAttachmentManager`, `AsyncIOBaseAttachmentManager` |
-| `vintasend_templates_manager/replication_queue_service.py` | Queued multi-backend replication (optional) | `BaseNotificationReplicationQueueService`, `AsyncIOBaseNotificationReplicationQueueService` |
-
-Each module has a matching `tests/test_*.py` asserting the stub is importable, subclasses the
-right ABC, and has no leftover abstract methods.
-
-There is no `logger.py` stub here. `vintasend` does not have a logger seam yet — if one ships,
-add a `logger.py` stub and matching test alongside that work.
-
-## Workflow
-
-1. **Clone.** Run the clone script against a target directory:
-
-   ```bash
-   python templates/vintasend-templates-manager/scripts/clone.py /path/to/vintasend-your-integration --package-name vintasend-your-integration
-   ```
-
-   This copies the skeleton, renames the distribution (`vintasend-templates-manager` →
-   your kebab-case name) and the import package (`vintasend_templates_manager` → your
-   snake_case name) everywhere they appear, and prints the next commands to run. See
-   `scripts/clone.py`'s module docstring for exactly what it does and does not touch.
-
-2. **Rename the classes.** The clone keeps every class named `ImplementationTemplate*` (for
-   example `ImplementationTemplateBackend`). Rename each one to match your integration —
-   `DjangoBackend`, `CeleryQueueService`, whatever fits. The clone script leaves this to you on
-   purpose: you will usually pick a name more specific than a blind find-and-replace could
-   guess.
-
-3. **Implement each component**, in this order:
-
-   1. Backend — every other seam reads and writes through it, so get it working first.
-   2. Template renderer — needs only the backend's data shapes, no delivery mechanism yet.
-   3. Adapter — delivery. Needs a working renderer to produce something to send.
-   4. Attachment manager — only if your integration supports attachments.
-   5. Queue service — only if delivery should happen in a background worker rather than the
-      calling process.
-   6. Replication queue service — only if a host using your backend wants queued multi-backend
-      replication (`replication_mode="queued"`) rather than the default inline replication.
-
-   Work through the checklist below one seam at a time. Each entry names the exact abstract
-   methods and points at the fake in `vintasend`'s own `stubs/` package as a working reference.
-
-4. **Test against the fakes.** Your new package's tests should exercise your real
-   implementation the way `vintasend`'s own suite exercises its fakes — no mocking the seam
-   itself. Run `poetry run pytest` after every component; the scaffold tests already in
-   `tests/` keep passing throughout, since they only assert the shape of the stub, not its
-   behavior.
-
-5. **Publish.** Once every seam you need is implemented and tested, this is an ordinary Poetry
-   package: `poetry build`, then publish it the way you publish any Python package. It depends
-   on `vintasend` by version range already — you do not need to touch that pin.
-
-## Per-component checklist
-
-Each checklist below is parsed by `vintasend/tests/test_template_checklist.py` in the main
-`vintasend` repo, which confirms every named method still exists on the current ABC. If a seam
-changes, that test fails before this doc goes stale.
-
-### Backend (storage seam)
-
-Implement `vintasend_templates_manager/backend.py`. Reference:
-`vintasend/services/notification_backends/stubs/fake_backend.py` (`FakeFileBackend` for the
-sync class, `FakeAsyncIOFileBackend` for the AsyncIO class).
-
-```checklist
-BaseNotificationBackend.get_all_pending_notifications
-BaseNotificationBackend.get_pending_notifications
-BaseNotificationBackend.get_all_future_notifications
-BaseNotificationBackend.get_future_notifications
-BaseNotificationBackend.get_all_future_notifications_from_user
-BaseNotificationBackend.get_future_notifications_from_user
-BaseNotificationBackend.persist_notification
-BaseNotificationBackend.persist_one_off_notification
-BaseNotificationBackend.persist_notification_update
-BaseNotificationBackend.mark_pending_as_sent
-BaseNotificationBackend.mark_pending_as_failed
-BaseNotificationBackend.mark_sent_as_read
-BaseNotificationBackend.mark_sent_as_read_bulk
-BaseNotificationBackend.cancel_notification
-BaseNotificationBackend.get_notification
-BaseNotificationBackend.filter_all_in_app_unread_notifications
-BaseNotificationBackend.filter_in_app_unread_notifications
-BaseNotificationBackend.filter_all_in_app_notifications
-BaseNotificationBackend.filter_in_app_notifications
-BaseNotificationBackend.filter_notifications
-BaseNotificationBackend.get_user_email_from_notification
-BaseNotificationBackend.store_context_used
-BaseNotificationBackend.store_git_commit_sha
-BaseNotificationBackend.store_attachment_file_record
-BaseNotificationBackend.get_attachment_file_record
-BaseNotificationBackend.find_attachment_file_by_checksum
-BaseNotificationBackend.delete_attachment_file
-BaseNotificationBackend.get_orphaned_attachment_files
-BaseNotificationBackend.get_attachments
-BaseNotificationBackend.delete_notification_attachment
-AsyncIOBaseNotificationBackend.get_all_pending_notifications
-AsyncIOBaseNotificationBackend.get_pending_notifications
-AsyncIOBaseNotificationBackend.get_all_future_notifications
-AsyncIOBaseNotificationBackend.get_future_notifications
-AsyncIOBaseNotificationBackend.get_all_future_notifications_from_user
-AsyncIOBaseNotificationBackend.get_future_notifications_from_user
-AsyncIOBaseNotificationBackend.persist_notification
-AsyncIOBaseNotificationBackend.persist_one_off_notification
-AsyncIOBaseNotificationBackend.persist_notification_update
-AsyncIOBaseNotificationBackend.mark_pending_as_sent
-AsyncIOBaseNotificationBackend.mark_pending_as_failed
-AsyncIOBaseNotificationBackend.mark_sent_as_read
-AsyncIOBaseNotificationBackend.mark_sent_as_read_bulk
-AsyncIOBaseNotificationBackend.cancel_notification
-AsyncIOBaseNotificationBackend.get_notification
-AsyncIOBaseNotificationBackend.filter_all_in_app_unread_notifications
-AsyncIOBaseNotificationBackend.filter_in_app_unread_notifications
-AsyncIOBaseNotificationBackend.filter_all_in_app_notifications
-AsyncIOBaseNotificationBackend.filter_in_app_notifications
-AsyncIOBaseNotificationBackend.filter_notifications
-AsyncIOBaseNotificationBackend.get_user_email_from_notification
-AsyncIOBaseNotificationBackend.store_context_used
-AsyncIOBaseNotificationBackend.store_git_commit_sha
-AsyncIOBaseNotificationBackend.store_attachment_file_record
-AsyncIOBaseNotificationBackend.get_attachment_file_record
-AsyncIOBaseNotificationBackend.find_attachment_file_by_checksum
-AsyncIOBaseNotificationBackend.delete_attachment_file
-AsyncIOBaseNotificationBackend.get_orphaned_attachment_files
-AsyncIOBaseNotificationBackend.get_attachments
-AsyncIOBaseNotificationBackend.delete_notification_attachment
-```
-
-Connected through the `NOTIFICATION_BACKEND` setting (a dotted import path to your class), read
-by `vintasend.app_settings.NotificationSettings` and passed into `NotificationService` /
-`AsyncIONotificationService`.
-
-### Template renderer (rendering seam)
-
-Implement `vintasend_templates_manager/template_renderer.py`. There is no AsyncIO twin
-for this seam — `render` stays synchronous everywhere, and async adapters call it directly.
-Reference: `vintasend/services/notification_template_renderers/stubs/fake_templated_email_renderer.py`
-(`FakeTemplateRenderer`). There is no reference fake for SMS yet; follow the same shape as the
-email renderer, or look at `vintasend-jinja`'s implementation.
-
-```checklist
-BaseNotificationTemplateRenderer.render
-BaseTemplatedEmailRenderer.render
-BaseTemplatedEmailRenderer.render_from_template_content
-BaseTemplatedSMSRenderer.render
-```
-
-Connected by passing it into your adapter — a renderer has no setting of its own;
-`vintasend`'s adapters accept one as a constructor argument (a live instance or a dotted import
-string).
-
-### Adapter (delivery seam)
-
-Implement `vintasend_templates_manager/adapter.py`. Use the plain classes
-(`BaseNotificationAdapter` / `AsyncIOBaseNotificationAdapter`) when delivery happens in the
-calling process, and the `Background*` classes when delivery should happen in a worker instead
-— see `vintasend/services/notification_adapters/async_base.py`'s docstring for the
-`send`/`delayed_send` split. Reference:
-`vintasend/services/notification_adapters/stubs/fake_adapter.py` (`FakeEmailAdapter`,
-`FakeAsyncIOEmailAdapter`, `FakeAsyncEmailAdapter`, `FakeAsyncIOBackgroundEmailAdapter`) and
-`vintasend/services/notification_adapters/stubs/fake_in_app_adapter.py` (`FakeInAppAdapter`,
-`FakeAsyncIOInAppAdapter`) for an in-app delivery example.
-
-```checklist
-BaseNotificationAdapter.send
-AsyncIOBaseNotificationAdapter.send
-BackgroundNotificationAdapter.send
-BackgroundNotificationAdapter.delayed_send
-AsyncIOBackgroundNotificationAdapter.send
-AsyncIOBackgroundNotificationAdapter.delayed_send
-```
-
-`BackgroundNotificationAdapter.send` and `AsyncIOBackgroundNotificationAdapter.send` are the
-same `send` you already implement on the plain adapter above — a background adapter inherits
-it, and only adds `delayed_send`.
-
-Connected through the `NOTIFICATION_ADAPTERS` setting: a list of `(dotted_class_path,
-notification_type)` pairs, read the same way as the backend.
-
-### Queue service (background send)
-
-Implement `vintasend_templates_manager/queue_service.py`. Only needed if you ship a
-`Background*` adapter — the queue service is how a notification id gets from
-`NotificationService.send()` to your worker; the worker then calls
-`NotificationService.delayed_send(notification_id)`, which reloads the notification and calls
-the adapter's `send`. Reference:
-`vintasend/services/notification_queue_services/stubs/fake_queue_service.py`
-(`FakeQueueService`, `FakeAsyncIOQueueService`).
-
-```checklist
-BaseNotificationQueueService.enqueue_notification
-AsyncIOBaseNotificationQueueService.enqueue_notification
-```
-
-Connected through the `NOTIFICATION_QUEUE_SERVICE` setting (a dotted import path). Unset means
-background sending is unsupported and `NotificationService` calls adapters directly instead.
-
-### Replication queue service (optional multi-backend seam)
-
-Implement `vintasend_templates_manager/replication_queue_service.py`. Only needed for
-**queued** multi-backend replication (`replication_mode="queued"`) -- this is a separate,
-optional seam from the backend and adapter above, and a host can use multiple backends with
-plain inline replication (the default) without ever touching it. When configured, this queue
-service is how a `(notification_id, backend_identifier)` pair gets from
-`NotificationService`'s write path to your worker; the worker then calls
-`NotificationService.process_replication(notification_id, backend_identifier)`, which converges
-that replica to the primary's current snapshot. Reference:
-`vintasend/services/notification_queue_services/stubs/fake_replication_queue_service.py`
-(`FakeReplicationQueueService`, `FakeAsyncIOReplicationQueueService`).
-
-```checklist
-BaseNotificationReplicationQueueService.enqueue_replication
-AsyncIOBaseNotificationReplicationQueueService.enqueue_replication
-```
-
-Connected through the `NOTIFICATION_REPLICATION_QUEUE_SERVICE` setting (a dotted import path).
-Unset with `replication_mode="queued"` falls back to inline replication (with a warning logged)
-rather than dropping replication silently.
-
-### Attachment manager (attachment storage)
-
-Implement `vintasend_templates_manager/attachment_manager.py`. Only needed if your
-integration supports notification attachments. A backend never reads, writes, or downloads a
-byte itself — it persists rows and hands `StorageIdentifiers` back to whichever manager was
-injected. `reconstruct_attachment_file` stays a plain (non-`async`) method even on the AsyncIO
-class, since it only builds a lazy handle and performs no I/O itself. Reference:
-`vintasend/services/attachment_managers/stubs/fake_attachment_manager.py`
-(`FakeAttachmentManager`, `FakeAsyncIOAttachmentManager`).
-
-```checklist
-BaseAttachmentManager.upload_file
-BaseAttachmentManager.reconstruct_attachment_file
-BaseAttachmentManager.delete_file_by_identifiers
-AsyncIOBaseAttachmentManager.upload_file
-AsyncIOBaseAttachmentManager.reconstruct_attachment_file
-AsyncIOBaseAttachmentManager.delete_file_by_identifiers
-```
-
-Connected through the `NOTIFICATION_ATTACHMENT_MANAGER` setting (a dotted import path). Unset
-means attachments are unsupported.
-
-## Manual copy, without the clone script
-
-If you would rather not run the script:
+## Install
 
 ```bash
-cp -r templates/vintasend-templates-manager /path/to/vintasend-your-integration
-cd /path/to/vintasend-your-integration
-# rename vintasend_templates_manager/ to your package's import name, update every
-# import that references it, update pyproject.toml's [project].name and [tool.poetry].packages,
-# then:
-poetry install
-poetry run pytest
-poetry run mypy
+poetry add vintasend-managed-templates
+# or
+pip install vintasend-managed-templates
 ```
 
-The script does exactly this, minus the manual find-and-replace.
+Python 3.10–3.14. The only dependencies are `vintasend` itself and `typing-extensions`.
+
+## The pieces
+
+| Piece | What it is |
+|---|---|
+| `BaseTemplateManagerBackend` | The storage seam. An ABC covering template CRUD, versions, status history, tags, filtering, and pagination. |
+| `ManagedTemplateService` | The API you call. Wraps a backend and a renderer with version resolution, status-transition rules, filter validation, and tag normalization. |
+| `ManagedTemplateEmailRenderer` / `ManagedTemplateSMSRenderer` | A vintasend template renderer that wraps *another* renderer and feeds it a stored template instead of a template path. |
+| `tags.slugify_tag` / `next_available_slug` | The shared slug rules, so every backend derives the same slug from the same text. |
+| `dataclasses`, `constants`, `filters`, `exceptions` | The wire types: `ManagedTemplate`, `ManagedTemplateTag`, the two status enums, the filter TypedDicts, and the error hierarchy. |
+
+Everything here is synchronous. There is no AsyncIO twin, because the seams it composes
+(`BaseTemplateManagerBackend` and vintasend's template renderer seam) are both synchronous.
+
+## Quick start
+
+```python
+from vintasend_managed_templates.dataclasses import ManagedTemplateCreateInput
+from vintasend_managed_templates.managed_template_renderer import ManagedTemplateEmailRenderer
+from vintasend_managed_templates.managed_template_service import ManagedTemplateService
+
+manager_backend = MyTemplateManagerBackend()          # any BaseTemplateManagerBackend
+renderer = ManagedTemplateEmailRenderer(
+    manager_backend,
+    inner_renderer,                                    # any vintasend email renderer
+)
+service = ManagedTemplateService(manager_backend, renderer)
+
+template = service.create_template(
+    ManagedTemplateCreateInput(
+        name="Welcome email",
+        description="Sent right after signup",
+        key="welcome",                                 # what notifications reference
+        template_managed_backend="django",             # which manager backend stores it
+        template_body="<p>Hi {{ name }}, welcome!</p>",
+        template_subject="Welcome aboard",
+        template_preheader=None,
+        tenant=None,
+        tags=["onboarding", "Black Friday"],
+    )
+)
+
+service.activate("welcome", changed_by="hugo@example.com")
+```
+
+To send through it, hand the wrapping renderer to your adapter and set the notification's
+`body_template` to the template **key** instead of a path:
+
+```python
+from vintasend.services.notification_service import NotificationService
+
+notification_service = NotificationService(
+    notification_adapters=[MyEmailAdapter(template_renderer=renderer, backend=notification_backend)],
+    notification_backend=notification_backend,
+)
+
+notification_service.create_notification(
+    user_id=user.id,
+    notification_type="EMAIL",
+    title="Welcome",
+    body_template="welcome",   # a managed template key, not a file path
+    context_name="welcome_context",
+    context_kwargs={"user_id": user.id},
+    send_after=None,
+    subject_template="",
+    preheader_template="",
+)
+```
+
+Pass the renderer as a live instance rather than as a dotted import string: it takes a backend and
+an inner renderer as constructor arguments, which a string path cannot supply.
+
+Nothing else about creating or sending notifications changes.
+
+### What the inner renderer has to do
+
+`ManagedTemplateRenderer` looks the template up, builds an `EmailTemplateContent` (or a
+`TemplateContent` for SMS) out of the stored strings, and calls the inner renderer's
+`render_from_template_content`. So the inner renderer receives **template source in the
+`body_template` field**, where it normally expects a name a loader can resolve.
+
+Renderers that resolve names through a loader — `JinjaTemplatedEmailRenderer`,
+`DjangoTemplatedEmailRenderer` — need a loader that will accept source. For Jinja that is one
+line:
+
+```python
+from jinja2 import Environment, FunctionLoader
+from vintasend_jinja.services.notification_template_renderers.jinja_templated_email_renderer import (
+    JinjaTemplatedEmailRenderer,
+)
+
+inner_renderer = JinjaTemplatedEmailRenderer(Environment(loader=FunctionLoader(lambda source: source)))
+```
+
+A renderer written to compile source directly needs no such setup.
+
+## Templates and versions
+
+Templates are **versioned, never edited in place**. `update_template` copies the latest version
+forward, applies the non-`None` fields of the input, and returns the new version — so a published
+version's body can never change under a notification that already referenced it.
+
+```python
+from vintasend_managed_templates.dataclasses import ManagedTemplateUpdateInput
+
+service.update_template("welcome", ManagedTemplateUpdateInput(
+    name=None,                       # None leaves the field as the previous version had it
+    description=None,
+    template_body="<p>Hi {{ name }}, welcome aboard!</p>",
+    template_subject=None,
+    template_preheader=None,
+    tags=None,                       # None carries tags forward; [] clears them
+))
+
+service.get_template("welcome")            # latest version
+service.get_template("welcome", version=1) # a specific one
+service.get_template_versions("welcome")   # every version, newest first
+```
+
+`version=None` means "the latest version of this key" everywhere in the service — reads, status
+changes, tagging, and rendering — so callers only deal with version numbers when they actually
+want a specific one.
+
+## Statuses
+
+A version moves through `DRAFT → ACTIVE → INACTIVE → ARCHIVED`, and every move is written to the
+backend's audit trail:
+
+```python
+service.activate("welcome", changed_by="hugo@example.com")
+service.deactivate("welcome")
+service.archive("welcome", version=1)
+service.get_status_history("welcome")      # newest change first
+service.can_transition_to(template, ManagedTemplateStatus.ACTIVE)
+```
+
+The default transition table:
+
+| From | May move to |
+|---|---|
+| `DRAFT` | `ACTIVE`, `ARCHIVED` |
+| `ACTIVE` | `INACTIVE`, `ARCHIVED` |
+| `INACTIVE` | `ACTIVE`, `ARCHIVED` |
+| `ARCHIVED` | — terminal |
+
+Anything else raises `ManagedTemplateStatusTransitionError`. Setting a version to the status it
+already holds is a no-op: no history entry, no error. Override `ALLOWED_STATUS_TRANSITIONS` on a
+subclass for a different lifecycle, or pass `validate_status_transitions=False` to leave the
+ordering entirely to your application.
+
+Two things the service deliberately does *not* decide for you:
+
+* **A key may have several `ACTIVE` versions at once.** Activating one does not deactivate the
+  others; choosing which active version wins at render time is the host's call.
+* **`changed_by` is passed through untouched, `None` included.** Attribution is never required.
+
+## Tags
+
+Tags are many-to-many with template *versions* and are identified by a slug derived from the text
+someone typed. Slugging lives in `vintasend_managed_templates.tags` rather than in a backend, so a
+Django store and a SQLAlchemy store agree on what `Promoção` slugs to. Every call that takes a slug
+also accepts the original text.
+
+```python
+service.add_template_tags("welcome", ["Black Friday"])   # creates the tag if it is new
+service.remove_template_tags("welcome", ["black-friday"])
+service.set_template_tags("welcome", ["onboarding"])     # replaces; [] clears
+service.get_templates_by_tags(["onboarding", "email"], match_all=False)
+service.get_active_tags()                                # what a tag picker should show
+```
+
+Retagging **edits the version in place** instead of creating one. Tags are how a template is
+found, not part of what it renders, so relabelling for findability does not spawn a version and
+drop it back to `DRAFT`.
+
+Archiving a tag (`archive_tag` / `restore_tag`) takes it out of the pickers but keeps every link:
+filtering by an archived tag still returns the templates carrying it. `delete_tag` is the
+irreversible one — it removes the label from the templates too.
+
+Text with nothing sluggable in it (`"  "`, `"!!!"`) raises `ManagedTemplateInvalidTagError` at the
+call site, rather than becoming a tag no filter can ever name.
+
+## Filtering and pagination
+
+Filters are plain dicts, typed by the TypedDicts in `filters.py`, and compose with `and` / `or` /
+`not`:
+
+```python
+service.get_filtered_templates({
+    "and": [
+        {"status": {"lookup": "in", "value": [ManagedTemplateStatus.ACTIVE]}},
+        {"name": {"lookup": "includes", "value": "welcome", "case_sensitive": False}},
+        {"includes_any_of_tags": ["onboarding", "transactional"]},
+        {"created_at_range": {"from": datetime(2026, 1, 1)}},
+    ]
+})
+
+service.get_paginated_filtered_templates(filters, page=1, page_size=20)  # page is 1-indexed
+```
+
+Fields: `name`, `description`, `key`, `version`, `template_managed_backend`, `status`,
+`created_at_range`, `updated_at_range`, `includes_all_tags`, `includes_any_of_tags`,
+`most_recent_active_version`. String lookups are `exact` / `starts_with` / `ends_with` /
+`includes`; numeric ones are `gt` / `gte` / `lt` / `lte`.
+
+### One row per key: `most_recent_active_version`
+
+The store holds a row per *version*, so an unfiltered read shows a template once for every
+version it has ever had. `most_recent_active_version` collapses that to one row per key — the
+highest-numbered `ACTIVE` or `DRAFT` version, which is what is live plus the draft on its way to
+replacing it. A key whose versions are all `INACTIVE` or `ARCHIVED` has no current version and
+drops out.
+
+```python
+service.get_all_templates()                          # one row per key — the current version
+service.get_all_templates(include_all_versions=True) # every version of every key
+service.get_paginated_templates(page=1, page_size=20)              # same default
+service.get_filtered_templates({"most_recent_active_version": True})  # the filter itself
+```
+
+**The two listing methods apply it by default**; pass `include_all_versions=True` for the raw
+read. `get_filtered_templates` and `get_paginated_filtered_templates` do *not* add it — a filter
+means what it says — so name the field yourself when a filtered listing should be one row per key
+too. `False` is the exact complement (every other row, retired keys included), the same set
+`{"not": {"most_recent_active_version": True}}` returns.
+
+Unlike every other field, this one is answered against the whole key rather than against the row
+being tested, so a backend evaluates it with a subquery over the key's other versions.
+
+`validate_filter` runs before every filtered read and raises `ManagedTemplateInvalidFilterError`
+for a typo'd field name, an `and`/`or` that is not a non-empty list, a logical group with sibling
+keys, a tag filter given as a bare string (which would otherwise be iterated character by
+character and silently match nothing), or a non-boolean `most_recent_active_version` (the string
+`"false"` is truthy, so it would ask for exactly what the caller meant to switch off). Lookup
+*values* stay the backend's authority.
+
+The empty-collection rules follow Python's own `all()` / `any()`: an empty `includes_all_tags`
+constrains nothing, an empty `includes_any_of_tags` matches nothing.
+
+## Rendering a specific version
+
+`ManagedTemplateRenderer.render` resolves a key to whatever version the backend hands back, which
+is what you want at send time. The service's `render` takes an explicit version instead:
+
+```python
+service.render(notification, context, version=3)      # preview an unpublished draft
+service.render_template(notification, template, context)  # a template already in hand, no read
+```
+
+That is how you preview a draft before publishing it, or re-render an old notification against the
+version that was live when it was sent.
+
+## Implementing a manager backend
+
+Subclass `BaseTemplateManagerBackend` and implement every abstract method. It splits into four
+groups:
+
+* **Versions** — `create_template`, `get_template`, `update_template`, `delete_template`
+* **Statuses** — `create_template_status_update`, `get_template_status_history`
+* **Tags** — `get_or_create_tags`, `create_tag`, `get_tag`, `update_tag`, `set_tag_status`,
+  `delete_tag`, `get_tags`, `get_template_tags`, `set_template_tags`
+* **Queries** — `get_all_templates`, `get_templates_by_status`, `get_filtered_templates`,
+  `get_paginated_templates`, `get_paginated_filtered_templates`
+
+What a backend owns, beyond storage: assigning version numbers, deriving tag slugs with
+`slugify_tag` and keeping them unique with `next_available_slug`, and translating the filter dicts
+into its own query language.
+
+`tests/fakes.py` in this repo has `InMemoryTemplateManagerBackend`, a complete, dependency-free
+implementation of the seam — the shortest readable reference for what each method owes its caller.
+The suite drives it end to end rather than mocking it, so it is a real implementation, not a stub.
+
+### Exceptions
+
+All of them subclass `ManagedTemplateError`:
+
+| Exception | Raised when |
+|---|---|
+| `ManagedTemplateNotFoundError` | The key, or that version of it, does not exist |
+| `ManagedTemplateInvalidFilterError` | A filter is malformed or names an unknown field |
+| `ManagedTemplateStatusTransitionError` | The status move is not allowed from the current status |
+| `ManagedTemplateChangeUserNotFoundError` | An update names a `changed_by` user that does not exist |
+| `ManagedTemplateTagNotFoundError` | No tag has that slug |
+| `ManagedTemplateTagAlreadyExistsError` | `create_tag` collides with an existing slug |
+| `ManagedTemplateInvalidTagError` | A tag's text has nothing that can be slugified |
+
+## Development
+
+```bash
+poetry install
+poetry run pytest          # coverage is on by default and fails the run below 90%
+poetry run ruff check
+poetry run mypy
+poetry run tox             # the full 3.10–3.14 matrix
+```
+
+The suite runs fully offline against the in-memory backend — no database, no services.
