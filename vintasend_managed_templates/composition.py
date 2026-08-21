@@ -145,13 +145,6 @@ _REFERENCE_ARGS = re.compile(
     r"""^(?P<quote>["'])(?P<key>.*?)(?P=quote)(?:\s+version\s*=\s*(?P<version>\d+))?$"""
 )
 
-# ``"base-email[v2]"`` -- a version pinned inside the key itself, which is how a version is
-# named everywhere else a template key is written. The two spellings mean exactly the same
-# thing here; naming a version both ways at once is a syntax error rather than a precedence
-# rule nobody would remember. The suffix is reserved: a key really ending in ``[v3]`` cannot
-# be referenced without ``version=``.
-_KEY_VERSION_SUFFIX = re.compile(r"^(?P<key>.*)\[v(?P<version>\d+)\]$")
-
 
 @dataclasses.dataclass(frozen=True)
 class TemplateReference:
@@ -745,25 +738,6 @@ class TemplateComposer:
 
         key = match.group("key").strip()
         version = None if match.group("version") is None else int(match.group("version"))
-        suffixed = _KEY_VERSION_SUFFIX.match(key)
-
-        if suffixed is not None:
-            if version is not None:
-                raise self._syntax(
-                    f"{self._tag(tag)} names a version twice: '{key}' and version="
-                    f"{version}. Use one or the other",
-                    field,
-                    stack,
-                )
-            key = suffixed.group("key").strip()
-            version = int(suffixed.group("version"))
-            if not key:
-                raise self._syntax(
-                    f"{self._tag(tag)} has a version but no template key -- got {_shown(args)}",
-                    field,
-                    stack,
-                )
-
         return key, version
 
     def _block_name(self, args: str, field: str, stack: tuple[_Origin, ...]) -> str:

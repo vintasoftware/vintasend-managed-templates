@@ -1000,41 +1000,64 @@ def test_the_check_recomputes_rather_than_reading_the_flag(service, backend):
 # ----------------------------------------------------------------------
 
 
-def test_a_key_can_name_its_version_inline(store, composer):
+def test_a_parent_can_be_pinned_to_a_version(store, composer):
     store.add(make_template("base", "v1:{% managed_children %}", version=1))
     store.add(make_template("base", "v2:{% managed_children %}", version=2))
-    child = store.add(make_template("welcome", '{% managed_extends "base[v1]" %}Hi'))
+    child = store.add(make_template("welcome", '{% managed_extends "base" version=1 %}Hi'))
 
     assert composer.compose(child).body_template == "v1:Hi"
 
 
-def test_an_include_can_name_its_version_inline(store, composer):
+def test_an_unpinned_parent_resolves_to_the_current_version(store, composer):
+    """The counterpart: no ``version=`` means "whatever that key is now"."""
+    store.add(make_template("base", "v1:{% managed_children %}", version=1))
+    store.add(make_template("base", "v2:{% managed_children %}", version=2))
+    child = store.add(make_template("welcome", '{% managed_extends "base" %}Hi'))
+
+    assert composer.compose(child).body_template == "v2:Hi"
+
+
+def test_an_include_can_be_pinned_to_a_version(store, composer):
     store.add(make_template("footer", "old", version=1))
     store.add(make_template("footer", "new", version=2))
-    page = store.add(make_template("page", '{% managed_include "footer[v1]" %}'))
+    page = store.add(make_template("page", '{% managed_include "footer" version=1 %}'))
 
     assert composer.compose(page).body_template == "old"
 
 
-def test_the_inline_version_is_reported_as_a_reference(composer):
-    template = make_template("welcome", '{% managed_extends "base[v2]" %}')
+def test_the_pinned_version_is_reported_as_a_reference(composer):
+    template = make_template("welcome", '{% managed_extends "base" version=2 %}')
 
     assert composer.references(template) == [
         TemplateReference("extends", "base", 2, "body_template")
     ]
 
 
-def test_naming_the_version_twice_is_refused(store, composer):
-    template = store.add(make_template("welcome", '{% managed_extends "base[v2]" version=3 %}'))
+def test_whitespace_around_the_version_is_tolerated(store, composer):
+    store.add(make_template("base", "v1:{% managed_children %}", version=1))
+    store.add(make_template("base", "v2:{% managed_children %}", version=2))
+    child = store.add(make_template("welcome", '{% managed_extends "base" version = 1 %}Hi'))
 
-    with pytest.raises(ManagedTemplateCompositionSyntaxError, match="names a version twice"):
-        composer.compose(template)
+    assert composer.compose(child).body_template == "v1:Hi"
 
 
-def test_a_version_with_no_key_is_refused(store, composer):
-    template = store.add(make_template("welcome", '{% managed_extends "[v2]" %}'))
+def test_a_bracketed_version_in_the_key_is_just_part_of_the_key(store, composer):
+    """``version=`` is the only spelling, so ``"base[v1]"`` names a key, not a pin.
 
-    with pytest.raises(ManagedTemplateCompositionSyntaxError, match="no template key"):
+    It resolves like any other key, and reports itself as one -- there is no reserved
+    syntax inside a key any more.
+    """
+    template = make_template("welcome", '{% managed_extends "base[v1]" %}')
+
+    assert composer.references(template) == [
+        TemplateReference("extends", "base[v1]", None, "body_template")
+    ]
+
+
+def test_a_malformed_version_is_refused(store, composer):
+    template = store.add(make_template("welcome", '{% managed_extends "base" version=x %}'))
+
+    with pytest.raises(ManagedTemplateCompositionSyntaxError, match="version=N"):
         composer.compose(template)
 
 

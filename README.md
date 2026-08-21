@@ -172,11 +172,11 @@ business.
 
 | Tag | What it does |
 |---|---|
-| `{% managed_extends "key" %}` | This template is a child of `key`. At most one per template, never inside a block. Pin the parent with `"key[v2]"` or `version=2`. |
+| `{% managed_extends "key" %}` | This template is a child of `key`. At most one per template, never inside a block. Pin the parent with `version=2`. |
 | `{% managed_children %}` | In a base: where the child's content goes. Rendered with no child, the hole is simply empty. |
 | `{% managed_block name %}…{% managed_endblock %}` | A named region a child may replace. Unreplaced, it renders what it was declared with. Blocks may nest. |
 | `{% managed_super %}` | Inside a child's block: the content it is overriding. Chains through as many levels of inheritance as there are. |
-| `{% managed_include "key" %}` | Splice another template in here. It is composed in full first, so an include may itself extend and include. Pins the same way: `"key[v7]"`. |
+| `{% managed_include "key" %}` | Splice another template in here. It is composed in full first, so an include may itself extend and include. Pins the same way: `version=7`. |
 
 Everything a child writes **outside** a block is its children content, and it lands in the base's
 `{% managed_children %}`. So a child can both fill the hole and override named regions — which is
@@ -248,18 +248,15 @@ currently is. Pin it when a template must keep composing against an exact parent
 old notification resolves the child's version explicitly, but its unpinned bases still resolve to
 today's.
 
-Two spellings, identical in meaning — the suffix reads better inline, `version=` reads better when
-the key is long:
+`version=N` is the only spelling, on both tags that take a reference:
 
 ```
-{% managed_extends "base-email[v2]" %}
 {% managed_extends "base-email" version=2 %}
-{% managed_include "footer[v7]" %}
+{% managed_include "footer" version=7 %}
 ```
 
-Naming a version both ways at once is a syntax error rather than a precedence rule nobody would
-remember. The `[vN]` suffix is reserved: a template key that genuinely ends in `[v3]` can only be
-referenced with `version=`.
+Nothing inside the quoted key is interpreted, so a key is only ever a key — a template genuinely
+named `base-email[v2]` is referenced exactly as written, with no escaping and no special case.
 
 ### Checking a template before it ships
 
