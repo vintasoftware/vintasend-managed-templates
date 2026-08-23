@@ -330,17 +330,20 @@ class BackendWithoutOrdering(InMemoryTemplateManagerBackend):
 
     Its paginated methods take no ``order_by``, and it declares nothing -- so every
     ``orderBy.*`` key falls to the False default and it is never handed one.
+
+    Dropping the argument narrows the seam's signature, so mypy flags both overrides. That
+    narrowing is the thing under test -- the ignores keep it, rather than fixing it.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.filter_capabilities = {}
 
-    def get_paginated_templates(self, page: int, page_size: int):
+    def get_paginated_templates(self, page: int, page_size: int):  # type: ignore[override]
         self.calls.append("get_paginated_templates")
         return self._page(self.templates, page, page_size)
 
-    def get_paginated_filtered_templates(self, filters, page: int, page_size: int):
+    def get_paginated_filtered_templates(self, filters, page: int, page_size: int):  # type: ignore[override]
         self.calls.append("get_paginated_filtered_templates")
         return self._page([t for t in self.templates if self._matches(t, filters)], page, page_size)
 

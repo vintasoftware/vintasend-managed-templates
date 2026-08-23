@@ -16,7 +16,7 @@ import datetime
 
 import pytest
 
-from vintasend_managed_templates.constants import ManagedTemplateStatus
+from vintasend_managed_templates.constants import ManagedTemplateStatus, ManagedTemplateTagStatus
 from vintasend_managed_templates.dataclasses import ManagedTemplate, ManagedTemplateTag
 from vintasend_managed_templates.filters import (
     DEFAULT_TEMPLATE_BACKEND_FILTER_CAPABILITIES,
@@ -131,7 +131,12 @@ def make_template(
         updated=created,
         tags=[
             ManagedTemplateTag(
-                id=slug, text=slug, slug=slug, status="active", created=NOW, updated=NOW
+                id=slug,
+                text=slug,
+                slug=slug,
+                status=ManagedTemplateTagStatus.ACTIVE,
+                created=NOW,
+                updated=NOW,
             )
             for slug in tags
         ],
