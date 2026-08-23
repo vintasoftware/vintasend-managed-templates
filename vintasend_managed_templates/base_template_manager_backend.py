@@ -9,7 +9,7 @@ from .dataclasses import (
     ManagedTemplateTag,
     ManagedTemplateUpdateInput,
 )
-from .filters import ManagedTemplateFilter
+from .filters import ManagedTemplateFilter, ManagedTemplateOrderBy
 
 
 class BaseTemplateManagerBackend(ABC):
@@ -315,12 +315,27 @@ class BaseTemplateManagerBackend(ABC):
         ...
 
     @abstractmethod
-    def get_paginated_templates(self, page: int, page_size: int) -> Iterable[ManagedTemplate]:
+    def get_paginated_templates(
+        self,
+        page: int,
+        page_size: int,
+        order_by: "ManagedTemplateOrderBy | None" = None,
+    ) -> Iterable[ManagedTemplate]:
         """
         Retrieves a paginated list of templates from the backend.
 
+        ``order_by`` is optional and every ``orderBy.*`` capability defaults to False, so a
+        backend written before ordering existed keeps working unchanged and keeps an honest
+        report -- the service never passes one it has not been told the backend can apply.
+
+        A backend that accepts an order MUST apply it to the whole result set BEFORE paging.
+        Sorting a page after it has been chosen orders rows *within* the page while the rows
+        selected *for* it came back in the store's own order: right on page 1, wrong on every
+        page after it.
+
         param page: int
         param page_size: int
+        param order_by: ManagedTemplateOrderBy | None
         return: Iterable[ManagedTemplate]
         """
         ...
@@ -331,13 +346,41 @@ class BaseTemplateManagerBackend(ABC):
         filters: ManagedTemplateFilter,
         page: int,
         page_size: int,
+        order_by: "ManagedTemplateOrderBy | None" = None,
     ) -> Iterable[ManagedTemplate]:
         """
         Retrieves a paginated list of templates matching the given filters from the backend.
 
+        ``order_by`` carries the same contract as on ``get_paginated_templates``: optional,
+        never passed unless the backend's report says it can be applied, and applied to the
+        whole result set before paging.
+
         param filters: ManagedTemplateFilter
         param page: int
         param page_size: int
+        param order_by: ManagedTemplateOrderBy | None
         return: Iterable[ManagedTemplate]
         """
         ...
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Report which filter fields, string lookups, logical composition and sort fields this
+        backend supports.
+
+        Keys are camelCase dotted (``'fields.templateManagedBackend'``, ``'orderBy.createdAt'``)
+        and a backend declares ONLY what it *cannot* do -- ``ManagedTemplateService`` merges
+        this report OVER ``DEFAULT_TEMPLATE_BACKEND_FILTER_CAPABILITIES``, so a missing key
+        means supported. This concrete default returns ``{}`` (everything supported), which is
+        why it is not abstract: a backend that shipped before capabilities existed keeps
+        working and reads as fully capable, which it was already assumed to be.
+
+        The ``orderBy.*`` keys are the exception to "a missing key means supported". They
+        default to False in the merged report, so a backend that can sort MUST say so
+        explicitly -- and MUST declare only what its store genuinely does, verified by running
+        the sort rather than by reading the store's documentation. Claiming an order a backend
+        does not apply is worse than admitting it cannot: nothing downstream can detect it.
+
+        return: dict[str, bool]
+        """
+        return {}

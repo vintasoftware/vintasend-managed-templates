@@ -42,6 +42,11 @@ from vintasend_managed_templates.exceptions import (
     ManagedTemplateTagAlreadyExistsError,
     ManagedTemplateTagNotFoundError,
 )
+from vintasend_managed_templates.filters import (
+    MANAGED_TEMPLATE_ORDER_BY_FIELDS,
+    order_by_capability_key,
+    sort_templates,
+)
 from vintasend_managed_templates.tags import next_available_slug, slugify_tag
 
 
@@ -73,6 +78,13 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
         self.calls: list[str] = []
         self._ids = itertools.count(1)
         self._ticks = itertools.count()
+        # This backend reads a complete set into memory before paging, so it can honour every
+        # order the vocabulary defines. Declared explicitly because ``orderBy.*`` keys default
+        # to False -- a backend that can sort has to say so. Mutate it in a test to stand in
+        # for a store that cannot.
+        self.filter_capabilities: dict[str, bool] = {
+            order_by_capability_key(field): True for field in MANAGED_TEMPLATE_ORDER_BY_FIELDS
+        }
 
     # -- helpers ----------------------------------------------------------
 
@@ -363,15 +375,23 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
         self.calls.append("get_filtered_templates")
         return [t for t in self.templates if self._matches(t, filters)]
 
-    def get_paginated_templates(self, page: int, page_size: int) -> list[ManagedTemplate]:
+    def get_paginated_templates(
+        self, page: int, page_size: int, order_by=None
+    ) -> list[ManagedTemplate]:
         self.calls.append("get_paginated_templates")
-        return self._page(self.templates, page, page_size)
+        # Sorted before paging, never after: a page sorted after it was chosen orders rows
+        # within the page while the rows chosen for it came back in insertion order.
+        return self._page(sort_templates(self.templates, order_by), page, page_size)
 
     def get_paginated_filtered_templates(
-        self, filters, page: int, page_size: int
+        self, filters, page: int, page_size: int, order_by=None
     ) -> list[ManagedTemplate]:
         self.calls.append("get_paginated_filtered_templates")
-        return self._page([t for t in self.templates if self._matches(t, filters)], page, page_size)
+        matched = [t for t in self.templates if self._matches(t, filters)]
+        return self._page(sort_templates(matched, order_by), page, page_size)
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        return dict(self.filter_capabilities)
 
     # -- filter evaluation ------------------------------------------------
 

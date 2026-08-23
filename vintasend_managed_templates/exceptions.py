@@ -16,6 +16,21 @@ class ManagedTemplateInvalidFilterError(ManagedTemplateError):
     pass
 
 
+class ManagedTemplateUnsupportedOrderingError(ManagedTemplateError):
+    """Raised when an order the configured backend cannot apply is asked for.
+
+    An unsupported *filter* is dropped and the call succeeds, because the caller can see the
+    extra rows it gets back. An unsupported *order* is refused instead: ignoring it returns
+    exactly the rows that were asked for, in an arbitrary sequence, and nothing downstream can
+    tell that apart from a sort that happened. A caller renders those rows under a highlighted
+    "sorted by name" column and shows a sort that never ran.
+
+    ``ManagedTemplateService.get_supported_order_by_fields`` is how a caller asks first.
+    """
+
+    pass
+
+
 class ManagedTemplateChangeUserNotFoundError(ManagedTemplateError):
     """Raised when an update is made by an invalid changed_by user."""
 

@@ -66,12 +66,20 @@ from .exceptions import (
     ManagedTemplateInvalidFilterError,
     ManagedTemplateInvalidTagError,
     ManagedTemplateStatusTransitionError,
+    ManagedTemplateUnsupportedOrderingError,
 )
 from .filters import (
+    DEFAULT_TEMPLATE_BACKEND_FILTER_CAPABILITIES,
+    KNOWN_FILTER_FIELDS,
+    MANAGED_TEMPLATE_ORDER_BY_FIELDS,
     ManagedTemplateFilter,
     ManagedTemplateFilterFields,
+    ManagedTemplateFilterOrderByField,
+    ManagedTemplateOrderBy,
     is_field_filter,
     is_tags_filter,
+    order_by_capability_key,
+    prune_unsupported_filters,
 )
 from .managed_template_renderer import ManagedTemplateRenderer, TemplateContentType
 from .tags import normalize_tag_text, slugify_tag
@@ -93,9 +101,10 @@ logger = logging.getLogger(__name__)
 InputType = TypeVar("InputType", ManagedTemplateCreateInput, ManagedTemplateUpdateInput)
 
 
-# Read off the TypedDict rather than hand-listing the names, so adding a field to
-# ``ManagedTemplateFilterFields`` does not silently leave filter validation rejecting it.
-_KNOWN_FILTER_FIELDS: frozenset[str] = frozenset(ManagedTemplateFilterFields.__annotations__)
+# Read off the TypedDict in ``filters`` rather than hand-listed here, so adding a field to
+# ``ManagedTemplateFilterFields`` does not silently leave filter validation rejecting it --
+# and so validation and capability negotiation agree on what the vocabulary is.
+_KNOWN_FILTER_FIELDS: frozenset[str] = frozenset(KNOWN_FILTER_FIELDS)
 
 # The filter fields whose value is a collection of tag slugs rather than a lookup dict.
 _TAG_FILTER_FIELDS: frozenset[str] = frozenset({"includes_all_tags", "includes_any_of_tags"})
@@ -174,6 +183,7 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         self.validate_status_transitions = validate_status_transitions
         self.compose_templates = compose_templates
         self.composer = composer or TemplateComposer.from_backend(template_manager_backend)
+        self._capabilities_cache: dict[str, bool] | None = None
 
     # ------------------------------------------------------------------
     # Versions
@@ -723,10 +733,14 @@ class ManagedTemplateService(Generic[TemplateContentType]):
             unknown field.
         """
         self.validate_filter(filters)
-        return list(self.template_manager_backend.get_filtered_templates(filters))
+        return list(self.template_manager_backend.get_filtered_templates(self._negotiate(filters)))
 
     def get_paginated_templates(
-        self, page: int, page_size: int, include_all_versions: bool = False
+        self,
+        page: int,
+        page_size: int,
+        include_all_versions: bool = False,
+        order_by: ManagedTemplateOrderBy | None = None,
     ) -> list[ManagedTemplate]:
         """
         Retrieves one page of templates, one row per key by default.
@@ -738,19 +752,31 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         param page: int -- 1-indexed.
         param page_size: int
         param include_all_versions: bool -- every version rather than the current one per key.
+        param order_by: ManagedTemplateOrderBy | None -- omitted asks for the backend's own
+            order, which is what an unordered listing has always returned.
         return: list[ManagedTemplate]
         raises ValueError: if ``page`` or ``page_size`` is below 1.
+        raises ManagedTemplateUnsupportedOrderingError: if the backend cannot apply
+            ``order_by``.
         """
         self._validate_pagination(page, page_size)
+        self.validate_order_by(order_by)
         if include_all_versions:
-            return list(self.template_manager_backend.get_paginated_templates(page, page_size))
-        return self.get_paginated_filtered_templates(_current_versions_only(), page, page_size)
+            return list(
+                self.template_manager_backend.get_paginated_templates(
+                    page, page_size, **self._order_by_kwarg(order_by)
+                )
+            )
+        return self.get_paginated_filtered_templates(
+            _current_versions_only(), page, page_size, order_by
+        )
 
     def get_paginated_filtered_templates(
         self,
         filters: ManagedTemplateFilter,
         page: int,
         page_size: int,
+        order_by: ManagedTemplateOrderBy | None = None,
     ) -> list[ManagedTemplate]:
         """
         Retrieves one page of the templates matching ``filters``.
@@ -758,16 +784,141 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         param filters: ManagedTemplateFilter
         param page: int -- 1-indexed.
         param page_size: int
+        param order_by: ManagedTemplateOrderBy | None
         return: list[ManagedTemplate]
         raises ManagedTemplateInvalidFilterError: if the filter is malformed or names an
             unknown field.
         raises ValueError: if ``page`` or ``page_size`` is below 1.
+        raises ManagedTemplateUnsupportedOrderingError: if the backend cannot apply
+            ``order_by``.
         """
         self.validate_filter(filters)
         self._validate_pagination(page, page_size)
+        self.validate_order_by(order_by)
         return list(
-            self.template_manager_backend.get_paginated_filtered_templates(filters, page, page_size)
+            self.template_manager_backend.get_paginated_filtered_templates(
+                self._negotiate(filters), page, page_size, **self._order_by_kwarg(order_by)
+            )
         )
+
+    # ------------------------------------------------------------------
+    # Capability negotiation
+    # ------------------------------------------------------------------
+
+    def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Report which filters and orders the configured backend supports.
+
+        The backend declares only what it *cannot* do; this merges that report OVER
+        ``DEFAULT_TEMPLATE_BACKEND_FILTER_CAPABILITIES``, so every capability the backend does
+        not mention comes back at the default. That is ``True`` for filters and ``False`` for
+        the six ``orderBy.*`` keys -- new vocabulary defaults to unsupported, because a
+        ``True`` default would have every backend that shipped before ordering existed claim
+        an order it silently ignores.
+
+        Keys are camelCase dotted (``'fields.templateManagedBackend'``,
+        ``'orderBy.createdAt'``), kept byte-identical to the TypeScript sibling so one
+        dashboard consumes either.
+
+        Cached for the life of the service. A backend's capabilities are a static property of
+        its implementation, so re-asking would buy nothing -- and this is now read on every
+        filtered call, not only when a caller asks for the report, because the filter is
+        negotiated against it before it reaches the backend.
+
+        return: dict[str, bool]
+        """
+        if self._capabilities_cache is None:
+            reported = self.template_manager_backend.get_filter_capabilities() or {}
+            self._capabilities_cache = {
+                **DEFAULT_TEMPLATE_BACKEND_FILTER_CAPABILITIES,
+                # Coerced so a backend returning a truthy non-boolean cannot put a
+                # non-boolean into a report the wire types as ``boolean``.
+                **{key: bool(value) for key, value in reported.items()},
+            }
+        return self._capabilities_cache
+
+    def get_supported_order_by_fields(self) -> list[ManagedTemplateFilterOrderByField]:
+        """
+        Every field the configured backend can order a listing by, in vocabulary order.
+
+        How a caller asks *before* it sends: an order the backend cannot apply is refused,
+        not dropped, so a UI builds its sortable columns from this rather than finding out
+        by catching ``ManagedTemplateUnsupportedOrderingError``. An empty list means the
+        backend can sort by nothing and no column should be offered as sortable.
+
+        return: list[ManagedTemplateFilterOrderByField]
+        """
+        capabilities = self.get_backend_supported_filter_capabilities()
+        return [
+            field
+            for field in MANAGED_TEMPLATE_ORDER_BY_FIELDS
+            if capabilities.get(order_by_capability_key(field)) is True
+        ]
+
+    def validate_order_by(self, order_by: ManagedTemplateOrderBy | None) -> None:
+        """
+        Refuse an order the backend cannot apply, rather than passing it on to be ignored.
+
+        Unlike an unsupported filter -- which is dropped, so the caller gets more rows than it
+        asked for and can see that -- an ignored order returns exactly the rows requested in
+        an arbitrary sequence. Nothing downstream can detect that, so the only honest options
+        are to apply it or to refuse, and the backend has already said which one this is.
+
+        param order_by: ManagedTemplateOrderBy | None -- None is always valid; it asks for
+            the backend's own order.
+        raises ManagedTemplateUnsupportedOrderingError: if the field is not orderable, the
+            direction is not asc/desc, or the backend declares it cannot order by the field.
+        """
+        if order_by is None:
+            return
+
+        field = order_by.get("field")
+        if field not in MANAGED_TEMPLATE_ORDER_BY_FIELDS:
+            orderable = ", ".join(MANAGED_TEMPLATE_ORDER_BY_FIELDS)
+            raise ManagedTemplateUnsupportedOrderingError(
+                f"'{field}' is not an orderable field. Order by one of: {orderable}."
+            )
+
+        direction = order_by.get("direction")
+        if direction not in ("asc", "desc"):
+            raise ManagedTemplateUnsupportedOrderingError(
+                f"'{direction}' is not a sort direction. Use 'asc' or 'desc'."
+            )
+
+        key = order_by_capability_key(field)
+        if not self.get_backend_supported_filter_capabilities().get(key):
+            raise ManagedTemplateUnsupportedOrderingError(
+                f"The configured template backend cannot order by '{field}' ({key} is "
+                f"False). Read get_backend_supported_filter_capabilities() and offer only "
+                f"the fields it reports."
+            )
+
+    def _negotiate(self, filters: ManagedTemplateFilter) -> ManagedTemplateFilter:
+        """The filter with everything the backend cannot answer removed.
+
+        A capability report nothing acts on is decoration, and every caller left to walk the
+        map itself would reach a slightly different conclusion. Dropping only ever widens the
+        result, so the failure mode is extra rows a caller can see -- ``get_all_templates()``
+        against a backend that cannot answer ``most_recent_active_version`` returns every
+        version rather than raising.
+
+        Ordering is *not* negotiated here. It is refused instead, because dropping it leaves
+        no trace in the rows for a caller to notice.
+        """
+        return prune_unsupported_filters(filters, self.get_backend_supported_filter_capabilities())
+
+    @staticmethod
+    def _order_by_kwarg(
+        order_by: ManagedTemplateOrderBy | None,
+    ) -> dict[str, ManagedTemplateOrderBy]:
+        """``{'order_by': ...}`` when there is one to pass, and nothing when there is not.
+
+        Passed as a keyword and only when set, so a backend written against the seam before
+        ordering existed -- whose paginated methods take no such argument -- keeps working.
+        It never receives one, because its ``orderBy.*`` keys are all False and
+        ``validate_order_by`` has already refused anything else.
+        """
+        return {} if order_by is None else {"order_by": order_by}
 
     def validate_filter(self, filters: ManagedTemplateFilter, _path: str = "filters") -> None:
         """
