@@ -434,6 +434,68 @@ character and silently match nothing), or a non-boolean `most_recent_active_vers
 The empty-collection rules follow Python's own `all()` / `any()`: an empty `includes_all_tags`
 constrains nothing, an empty `includes_any_of_tags` matches nothing.
 
+### What the backend can answer: capabilities
+
+Not every store can answer every filter, and a backend says which it cannot:
+
+```python
+service.get_backend_supported_filter_capabilities()
+# {'logical.and': True, ..., 'fields.includesAllTags': False, ..., 'orderBy.createdAt': True}
+```
+
+Keys are camelCase dotted — `fields.templateManagedBackend`, `orderBy.createdAt` — even though
+the Python field names are snake_case, because a report goes on the wire and is spelled
+identically in the TypeScript sibling. A backend declares only what it *cannot* do, and the
+service merges its report over `DEFAULT_TEMPLATE_BACKEND_FILTER_CAPABILITIES`, so a filter added
+in a later release does not force every backend to re-declare it.
+
+**The service acts on the report.** Before every filtered read, the parts the backend has
+declined are pruned away — a capability map nothing acts on is decoration, and every caller left
+to walk it themselves would reach a slightly different conclusion.
+
+Dropping only ever **widens**: a pruned filter matches everything the original matched and
+possibly more, so you see extra rows rather than missing ones. Every corner follows from that
+one rule — an `or` is dropped whole (removing a branch of a disjunction *narrows* it), and a
+`not` whose inside pruned away is dropped (negating "everything" is "nothing"). A bare string
+counts as `exact` *and* case-sensitive, so a backend lacking either cannot answer it.
+
+### Ordering
+
+`get_paginated_templates` and `get_paginated_filtered_templates` take an optional `order_by`:
+
+```python
+service.get_paginated_templates(
+    page=1, page_size=20, order_by={"field": "name", "direction": "asc"}
+)
+```
+
+Orderable fields are `key`, `name`, `version`, `status`, `created_at` and `updated_at` — each a
+scalar a backend already stores per row, so a store can answer it from an index. Tags are absent
+because ordering by a many-to-many has no single value to compare, and
+`most_recent_active_version` because it is a filter rather than a field.
+
+**Ask before you send.** Every `orderBy.*` capability defaults to `False`, so a backend that
+predates ordering — or simply cannot sort — reports nothing orderable:
+
+```python
+service.get_supported_order_by_fields()   # e.g. ['key', 'name', 'created_at']
+```
+
+**Filters are dropped; orders are refused.** An order the backend cannot apply raises
+`ManagedTemplateUnsupportedOrderingError` rather than being silently ignored:
+
+| | Unsupported filter | Unsupported order |
+|---|---|---|
+| What happens | pruned away, the call succeeds | raises |
+| If it were ignored | more rows than you asked for | the same rows, arbitrary sequence |
+| Can you tell? | yes — visible in the rows | **no** |
+
+`sort_templates(templates, order_by)` is the shared comparator, for a backend that reads a
+complete set anyway. It is total and stable: ties break on `(key, version)`, and neither the
+tiebreak nor the placement of absent values flips with the direction — either would let a page
+boundary move between two requests and drop or repeat a row. Strings compare by code point
+rather than by locale, so two machines serving two pages of one listing cannot disagree.
+
 ## Rendering a specific version
 
 Which version of a template a notification renders is decided in this order:
@@ -494,6 +556,30 @@ groups:
   `delete_tag`, `get_tags`, `get_template_tags`, `set_template_tags`
 * **Queries** — `get_all_templates`, `get_templates_by_status`, `get_filtered_templates`,
   `get_paginated_templates`, `get_paginated_filtered_templates`
+
+The two paginated methods take an optional `order_by`, and `get_filter_capabilities` is concrete
+rather than abstract, so neither breaks a backend written before they existed. See
+[Ordering](#ordering).
+
+`get_filter_capabilities` is concrete rather than abstract and returns `{}`, so a backend that
+declares nothing keeps working and reads as fully capable of every *filter*. Ordering is the
+exception: those keys default to `False`, so a backend that can sort has to say so —
+
+```python
+def get_filter_capabilities(self) -> dict[str, bool]:
+    return {
+        "logical.or": False,          # this store ANDs its query parameters
+        "orderBy.key": True,
+        "orderBy.createdAt": True,    # declare only what the store genuinely does
+    }
+```
+
+Verify each ordering claim by **running** the sort rather than reading your store's
+documentation: a store keeping versions as strings sorts 10 before 2 and looks correct until a
+key reaches its tenth version. A backend that accepts `order_by` must apply it to the whole
+result set *before* paging — sorting a page after it has been chosen orders rows within the page
+while the rows selected for it came back in the store's own order, which is right on page 1 and
+wrong on every page after.
 
 What a backend owns, beyond storage: assigning version numbers, deriving tag slugs with
 `slugify_tag` and keeping them unique with `next_available_slug`, deriving `is_abstract` with
