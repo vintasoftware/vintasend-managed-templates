@@ -47,6 +47,7 @@ from vintasend_managed_templates.filters import (
     order_by_capability_key,
     sort_templates,
 )
+from vintasend_managed_templates.lifecycle import assert_template_version_deletable
 from vintasend_managed_templates.tags import next_available_slug, slugify_tag
 
 
@@ -67,7 +68,10 @@ _DATE_RANGE_FIELDS = {"created_at_range": "created", "updated_at_range": "update
 class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
     """A complete, dependency-free implementation of the storage seam."""
 
-    def __init__(self) -> None:
+    def __init__(self, allow_deleting_published_versions: bool = False) -> None:
+        # Off by default, like the service's option of the same name: only a version that was
+        # never published can be deleted.
+        self.allow_deleting_published_versions = allow_deleting_published_versions
         self.templates: list[ManagedTemplate] = []
         self.status_history: list[ManagedTemplateStatusHistory] = []
         # slug -> tag. One shared pool; a template holds copies of the tags it carries, and
@@ -94,6 +98,13 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
     def _versions_of(self, template_key: str) -> list[ManagedTemplate]:
         return sorted((t for t in self.templates if t.key == template_key), key=lambda t: t.version)
 
+    def _next_version(self, template_key: str) -> int:
+        """One above any number the key has ever had: history outlives a deleted version."""
+        numbers = [t.version for t in self.templates if t.key == template_key] + [
+            record.version for record in self.status_history if record.template_key == template_key
+        ]
+        return max(numbers, default=0) + 1
+
     def _index_of(self, template: ManagedTemplate) -> int:
         return next(
             i
@@ -115,7 +126,7 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
             body_template=input.template_body,
             subject_template=input.template_subject,
             preheader_template=input.template_preheader,
-            version=len(self._versions_of(input.key)) + 1,
+            version=self._next_version(input.key),
             status=ManagedTemplateStatus.DRAFT,
             created=now,
             updated=now,
@@ -152,7 +163,7 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
         new_version = dataclasses.replace(
             latest,
             id=next(self._ids),
-            version=latest.version + 1,
+            version=self._next_version(template_key),
             status=ManagedTemplateStatus.DRAFT,
             updated=self._now(),
             name=input.name or latest.name,
@@ -194,6 +205,9 @@ class InMemoryTemplateManagerBackend(BaseTemplateManagerBackend):
     def delete_template(self, template_key: str, version: int | None = None) -> None:
         self.calls.append("delete_template")
         target = self.get_template(template_key, version)
+        if not self.allow_deleting_published_versions:
+            assert_template_version_deletable(target, self.status_history)
+        # The status history is left alone either way: it outlives the version.
         self.templates.pop(self._index_of(target))
 
     def create_template_status_update(
@@ -506,6 +520,11 @@ class RecordingSMSRenderer(BaseNotificationTemplateRenderer[TemplateContent]):
     def render_from_template_content(self, notification, template_content, context, **kwargs):
         self.render_from_content_calls.append(template_content)
         return TemplatedEmail(subject="", body=template_content.body_template.format(**context))
+
+
+def publish(backend: BaseTemplateManagerBackend, key: str = "welcome", version: int = 1) -> None:
+    """Activate one version, so an unpinned send has something published to render."""
+    backend.create_template_status_update(key, version, ManagedTemplateStatus.ACTIVE)
 
 
 def make_create_input(

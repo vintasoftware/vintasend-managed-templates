@@ -674,8 +674,10 @@ def test_a_nested_non_dict_is_rejected(service):
 # ----------------------------------------------------------------------
 
 
-def test_render_uses_the_latest_version_by_default(service, welcome):
+def test_render_uses_the_newest_active_version_by_default(service, welcome):
     service.update_template("welcome", make_update_input(template_body="Hey {name}!"))
+    service.activate("welcome", 1)
+    service.activate("welcome", 2)
 
     rendered = service.render(make_notification("welcome"), {"name": "Hugo"})
 
@@ -691,6 +693,7 @@ def test_render_pins_an_explicit_version(service, welcome):
 
 
 def test_render_produces_the_subject_too(service, welcome):
+    service.activate("welcome", 1)
     rendered = service.render(make_notification("welcome"), {"name": "Hugo"})
 
     assert rendered.subject == "Hello Hugo"
@@ -698,6 +701,7 @@ def test_render_produces_the_subject_too(service, welcome):
 
 def test_render_carries_the_preheader_when_the_template_has_one(service):
     service.create_template(make_create_input("receipt", template_preheader="Hi {name}, receipt"))
+    service.activate("receipt", 1)
 
     rendered = service.render(make_notification("receipt"), {"name": "Hugo"})
 
@@ -705,6 +709,7 @@ def test_render_carries_the_preheader_when_the_template_has_one(service):
 
 
 def test_render_bypasses_the_wrapped_renderers_own_render(service, welcome, inner_renderer):
+    service.activate("welcome", 1)
     service.render(make_notification("welcome"), {"name": "Hugo"})
 
     # Going through render() would resolve the key itself and ignore `version`.

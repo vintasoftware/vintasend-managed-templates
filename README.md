@@ -34,6 +34,7 @@ Python 3.10–3.14. The only dependencies are `vintasend` itself and `typing-ext
 | `ManagedTemplateEmailRenderer` / `ManagedTemplateSMSRenderer` | A vintasend template renderer that wraps *another* renderer and feeds it a stored template instead of a template path. |
 | `composition.TemplateComposer` | Resolves template inheritance and inclusion against the store, before the engine runs. |
 | `tags.slugify_tag` / `next_available_slug` | The shared slug rules, so every backend derives the same slug from the same text. |
+| `lifecycle` | The shared lifecycle rules: which version a send renders (`newest_active_version`) and which versions may be deleted (`is_template_version_deletable`). |
 | `dataclasses`, `constants`, `filters`, `exceptions` | The wire types: `ManagedTemplate`, `ManagedTemplateTag`, the two status enums, the filter TypedDicts, and the error hierarchy. |
 
 Everything here is synchronous. There is no AsyncIO twin, because the seams it composes
@@ -97,7 +98,67 @@ notification_service.create_notification(
 Pass the renderer as a live instance rather than as a dotted import string: it takes a backend and
 an inner renderer as constructor arguments, which a string path cannot supply.
 
-Nothing else about creating or sending notifications changes.
+Nothing else about creating or sending notifications changes. A send renders the key's newest
+**active** version -- see [Which version a send renders](#which-version-a-send-renders) -- so a
+template has to be activated before it goes out.
+
+### Sending before a template is written: fallbacks
+
+An application can register a default for each key, so it can send a notification before anyone
+has written its template in the store. While a key has nothing published, `render` hands the
+default to a renderer of your choosing. Once a version of the key is activated, sends use it.
+
+```python
+from vintasend_managed_templates.managed_template_renderer import (
+    FallbackTemplate,
+    ManagedTemplateEmailRenderer,
+    ManagedTemplateFallback,
+)
+
+renderer = ManagedTemplateEmailRenderer(
+    manager_backend,
+    inner_renderer,
+    fallback=ManagedTemplateFallback(
+        templates={
+            "welcome": FallbackTemplate(
+                subject_template="emails/welcome/subject.txt",   # file paths, for a file renderer
+                body_template="emails/welcome/body.html",
+                preheader_template=None,                         # optional
+            ),
+        },
+        # Optional. Defaults to the inner renderer, which takes template *source* -- so register
+        # source rather than paths when you leave this out.
+        renderer=DjangoTemplatedEmailRenderer(),
+    ),
+)
+
+renderer.get_fallback_template("welcome")   # the registered default, or None -- for a dashboard
+```
+
+The fallback renderer's `render` gets a copy of the notification (`dataclasses.replace`) with
+`body_template`, `subject_template` and `preheader_template` replaced by the registered values; a
+`None` becomes `""`. The SMS renderer takes the same option. The rules:
+
+* **Only when the key itself has nothing published**: no versions at all, or only drafts and
+  retired ones (the lookup raised `ManagedTemplateNotFoundError`, which includes
+  `ManagedTemplateNoActiveVersionError`). A stored template that fails to compose because it
+  extends a missing base raises `ManagedTemplateCompositionReferenceError` instead. That template
+  exists and is broken, and a default must not hide it.
+* **Only for an unpinned notification.** If a pinned version is missing, the template existed when
+  the notification was created, so the render raises.
+* **Only for a registered key.** The templates are copied into a plain `dict` when the renderer is
+  built, so a mapping with a default for missing keys (a `defaultdict`, say) never answers for a
+  key nobody registered.
+* **Only on `render`**, the send path. `ManagedTemplateService.render` and `render_template`
+  (what previews use) never fall back, and `get_latest_template_version` still answers `None` for
+  a key with nothing published.
+
+A fallback render leaves the send input's `template_version` as `None`, so the notification's
+`used_template_version` stays null. A render of a stored template always reports its version, so
+**a sent notification with a null `used_template_version` went out with the fallback**. That is
+how a host tells the two apart; `NotificationSendInput` has no field for the source. The renderer
+logs the key and the notification id when it falls back, at `INFO` on the
+`vintasend_managed_templates.managed_template_renderer` logger, and never the context.
 
 ### What the inner renderer has to do
 
@@ -309,14 +370,53 @@ service.update_template("welcome", ManagedTemplateUpdateInput(
     tags=None,                       # None carries tags forward; [] clears them
 ))
 
-service.get_template("welcome")            # latest version
+service.get_template("welcome")            # latest version, whatever its status
 service.get_template("welcome", version=1) # a specific one
+service.get_active_template("welcome")     # what an unpinned send renders
 service.get_template_versions("welcome")   # every version, newest first
 ```
 
-`version=None` means "the latest version of this key" everywhere in the service — reads, status
-changes, tagging, and rendering — so callers only deal with version numbers when they actually
-want a specific one.
+`version=None` means "the latest version of this key" for reads, status changes and tagging --
+the editing view, which includes a draft someone is working on. Sends are the exception, below.
+
+### Which version a send renders
+
+"Latest" means two things, and they are kept apart:
+
+| | Resolves to | Used by |
+|---|---|---|
+| The editing view | the newest version, whatever its status | `get_template(key)`, status changes, tagging, the API's reads |
+| The send path | the newest **`ACTIVE`** version | `render` on an unpinned notification, `service.render` with no version and no pin, `get_latest_template_version` |
+
+A draft is never sent: publishing is the deliberate act that puts a version in front of
+recipients. When several versions of a key are active at once, the **highest-numbered** active
+one renders. A key with no active version raises `ManagedTemplateNoActiveVersionError`, a subclass
+of `ManagedTemplateNotFoundError`, so a key holding only drafts counts as "not customized yet"
+and a registered fallback applies.
+
+A notification **pinned** to a version renders that version whatever its status today. The pin
+exists so a notification renders what was reviewed when it was created, so deactivating or
+archiving the version later does not change what a pinned notification renders.
+
+### Deleting a version
+
+Only a version that was **never published** can be deleted: one still in `DRAFT` whose status
+history records nothing but `DRAFT`. Anything else raises `ManagedTemplateDeletionNotAllowedError`.
+A published version may have rendered a notification that is pinned to it, and its status history
+records who published it. Retire it with `archive` instead.
+
+```python
+service.delete_template("welcome", version=3)   # fine while v3 is an unpublished draft
+service.delete_template("welcome", version=1)   # raises once v1 has been activated
+service.delete_template("welcome")              # the latest version, under the same rule
+```
+
+The status history is never deleted, even when the version is. The service resolves the version,
+checks the rule, and then deletes that exact version, so every backend is held to it; the Django
+backend checks it itself too. If an operator genuinely needs to hard-delete a published version,
+pass `allow_deleting_published_versions=True` to both the service and the backend.
+`lifecycle.is_template_version_deletable(template, history)` answers the question without
+attempting the delete.
 
 ## Statuses
 
@@ -348,7 +448,8 @@ ordering entirely to your application.
 Two things the service deliberately does *not* decide for you:
 
 * **A key may have several `ACTIVE` versions at once.** Activating one does not deactivate the
-  others; choosing which active version wins at render time is the host's call.
+  others. An unpinned send renders the highest-numbered active one, so activating an older
+  version while a newer one is active does not change what is sent.
 * **`changed_by` is passed through untouched, `None` included.** Attribution is never required.
 
 ## Tags
@@ -502,17 +603,18 @@ Which version of a template a notification renders is decided in this order:
 
 1. an explicit `version=` argument to `service.render()`,
 2. the notification's own `requested_template_version`,
-3. whatever version the backend considers current.
+3. the key's newest active version.
 
 ```python
-service.render(notification, context)                 # the notification's pin, or the latest
+service.render(notification, context)                 # the notification's pin, or the newest active
 service.render(notification, context, version=3)      # preview v3 regardless of the pin
 service.render_template(notification, template, context)   # a template already in hand
 ```
 
 The argument is for rendering a version the notification is *not* pinned to -- previewing an
 unpublished draft, or reproducing what an old notification looked like. Leave it off and you get
-what a real send would produce.
+what a real send would produce, except that a renderer's registered fallback is never used: a key
+with nothing published raises.
 
 ### Pinning a notification to a version
 
@@ -529,17 +631,18 @@ notification_service.create_notification(
     requested_template_version=3,      # render v3, now and forever
 )
 
-# Or pin to whatever version is current at this moment, without naming it:
+# Or pin to the newest active version at this moment, without naming it:
 notification_service.create_notification(..., pin_template_versions=True)
 
 # The same, as the default for every call on the service:
 notification_service = NotificationService(..., pin_template_versions=True)
 ```
 
-With `pin_template_versions=True`, the service asks this package's renderer for the current
-version through `get_latest_template_version()`, which resolves it the same way `get_template(key)`
-does. A key with nothing behind it answers `None` and the notification is created unpinned, rather
-than failing the creation over a template that may well exist by the time it is sent.
+With `pin_template_versions=True`, the service asks this package's renderer which version to pin
+through `get_latest_template_version()`, which answers the key's newest active version: the same
+version an unpinned send would render, so a draft is never pinned. A key with nothing published
+answers `None` and the notification is created unpinned, rather than failing the creation over a
+template that may well be published by the time it is sent.
 
 Whichever version renders is reported back on the send input as `template_version`, so vintasend
 can store it as `used_template_version`. For an unpinned notification that is the only record of
@@ -560,6 +663,19 @@ groups:
 The two paginated methods take an optional `order_by`, and `get_filter_capabilities` is concrete
 rather than abstract, so neither breaks a backend written before they existed. See
 [Ordering](#ordering).
+
+`get_active_template` -- the newest `ACTIVE` version, for the send path -- is concrete too. Leave
+it out and it is answered with `get_filtered_templates({"key": key, "status": ACTIVE})`.
+Override it when your store can answer more cheaply, picking the version with
+`lifecycle.newest_active_version` and raising `lifecycle.no_active_version(key)` for a key that
+exists but has no active version, so every backend applies the same rule.
+
+`delete_template` **refuses a published version and keeps the status history.** Call
+`lifecycle.assert_template_version_deletable` before deleting, put any hard delete of a published
+version behind an option that is off by default, and keep each history entry readable through
+`get_template_status_history` after its version is gone. Since history is read by key and
+version, never reuse a deleted version's number: number a new version one above the highest the
+key has ever had, history included.
 
 `get_filter_capabilities` is concrete rather than abstract and returns `{}`, so a backend that
 declares nothing keeps working and reads as fully capable of every *filter*. Ordering is the
@@ -602,6 +718,8 @@ All of them subclass `ManagedTemplateError`:
 | Exception | Raised when |
 |---|---|
 | `ManagedTemplateNotFoundError` | The key, or that version of it, does not exist |
+| `ManagedTemplateNoActiveVersionError` | A send resolved a key that exists but has no `ACTIVE` version. Subclasses `ManagedTemplateNotFoundError` |
+| `ManagedTemplateDeletionNotAllowedError` | Deleting a version that has been published -- archive it instead |
 | `ManagedTemplateInvalidFilterError` | A filter is malformed or names an unknown field |
 | `ManagedTemplateStatusTransitionError` | The status move is not allowed from the current status |
 | `ManagedTemplateChangeUserNotFoundError` | An update names a `changed_by` user that does not exist |
