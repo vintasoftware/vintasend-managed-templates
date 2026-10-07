@@ -10,6 +10,7 @@ from .dataclasses import (
     ManagedTemplateUpdateInput,
 )
 from .filters import ManagedTemplateFilter, ManagedTemplateOrderBy
+from .lifecycle import newest_active_version, no_active_version
 
 
 class BaseTemplateManagerBackend(ABC):
@@ -47,12 +48,52 @@ class BaseTemplateManagerBackend(ABC):
         """
         Retrieves a template from the backend by its key.
 
+        ``version=None`` returns the latest version, whatever its status. That is the *editing
+        view*: an editor or an API wants the draft someone is working on. A send never renders
+        it -- sends go through ``get_active_template`` instead.
+
         param template_key: str
         param version: int | None
         return: ManagedTemplate
+        raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
         """
 
         ...
+
+    def get_active_template(self, template_key: str) -> ManagedTemplate:
+        """
+        Retrieves the version an unpinned send renders: the highest-numbered ACTIVE version.
+
+        Drafts are skipped whatever their number, and so are INACTIVE and ARCHIVED versions. A
+        key may hold several active versions at once; the highest-numbered of them wins.
+
+        Not abstract, so a backend written before this method existed keeps working. This
+        default answers through ``get_filtered_templates`` with an exact key match and
+        ``status`` ACTIVE, then checks key and status again on what comes back, so a backend
+        that ignores part of that filter still gets the right answer. Override it when your
+        store can answer more cheaply, using ``lifecycle.newest_active_version`` and raising
+        ``lifecycle.no_active_version(key)``, so every backend applies the same rule and
+        raises the same error.
+
+        param template_key: str
+        return: ManagedTemplate
+        raises ManagedTemplateNotFoundError: if the key does not exist.
+        raises ManagedTemplateNoActiveVersionError: if the key exists but no version of it is
+            ACTIVE.
+        """
+        active = newest_active_version(
+            template
+            for template in self.get_filtered_templates(
+                {"key": template_key, "status": ManagedTemplateStatus.ACTIVE}
+            )
+            if template.key == template_key
+        )
+        if active is not None:
+            return active
+        # Tells "never created" apart from "nothing published": this read raises the plain
+        # not-found error for a key with no versions at all.
+        self.get_template(template_key)
+        raise no_active_version(template_key)
 
     @abstractmethod
     def update_template(
@@ -83,9 +124,25 @@ class BaseTemplateManagerBackend(ABC):
     @abstractmethod
     def delete_template(self, template_key: str, version: int | None = None) -> None:
         """
-        Deletes a template from the backend by its key.
+        Deletes one version of a template, or its latest version when ``version`` is None.
+
+        Only a version that was never published may be deleted: still in DRAFT, with nothing
+        but DRAFT in its status history (``lifecycle.is_template_version_deletable``). Refuse
+        anything else with ``ManagedTemplateDeletionNotAllowedError`` -- call
+        ``lifecycle.assert_template_version_deletable`` -- unless the backend's operator
+        explicitly turned on an option that allows it. ``ManagedTemplateService`` checks the
+        rule before calling this either way, so a backend that does not enforce it is still
+        protected when it is used through the service.
+
+        Never delete the version's status history. It records who published what, and it has
+        to outlive the version it describes, readable through ``get_template_status_history``.
+        For the same reason, never give a later version a deleted version's number: it would
+        inherit that version's history.
 
         param template_key: str
+        param version: int | None
+        raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        raises ManagedTemplateDeletionNotAllowedError: if the version has been published.
         """
         ...
 
@@ -113,6 +170,9 @@ class BaseTemplateManagerBackend(ABC):
     ) -> Iterable[ManagedTemplateStatusHistory]:
         """
         Retrieves the status history of a template from the backend.
+
+        History outlives the versions it describes: a deleted version's entries are still
+        returned, so a key whose versions are all gone can still have a trail to read.
 
         param template_key: str
         param version: int | None

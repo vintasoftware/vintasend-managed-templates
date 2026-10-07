@@ -8,12 +8,16 @@ implementation of that ABC.
 
 What the service adds on top of the raw backend:
 
-* **Version resolution.** ``version=None`` consistently means "the latest version of this key"
-  across reads, status changes, and rendering, so callers never juggle version numbers unless
-  they want a specific one.
+* **Version resolution.** ``version=None`` means "the latest version of this key" across reads,
+  status changes and tagging -- the editing view, whatever the version's status. Sends are the
+  exception: an unpinned render resolves to the key's newest ACTIVE version, so a draft is never
+  sent (see ``lifecycle``).
 * **Status transitions.** Status changes are validated against
   ``ALLOWED_STATUS_TRANSITIONS`` and then written through the backend's audit trail, with
   named helpers (``activate`` / ``deactivate`` / ``archive``) for the common moves.
+* **Deletion rule.** Only a version that was never published can be deleted, whatever the
+  backend does on its own; a published version is retired with ``archive``. Status history is
+  never deleted.
 * **Filter validation.** Filters are checked for shape and field names before they reach the
   backend, so a typo raises ``ManagedTemplateInvalidFilterError`` here instead of silently
   matching nothing (or blowing up) deep inside a backend's query translation.
@@ -36,8 +40,7 @@ What the service adds on top of the raw backend:
 Two deliberate non-policies, both chosen so the service stays a thin orchestration layer:
 
 * A key may have **any number of ACTIVE versions at once**. Activating a version does not touch
-  the ones already active; deciding which active version wins at render time is the host's
-  call.
+  the ones already active. An unpinned send renders the highest-numbered of them.
 * ``changed_by`` is **passed through untouched**, ``None`` included. The service never requires
   attribution on a status change.
 
@@ -81,6 +84,7 @@ from .filters import (
     order_by_capability_key,
     prune_unsupported_filters,
 )
+from .lifecycle import assert_template_version_deletable
 from .managed_template_renderer import ManagedTemplateRenderer, TemplateContentType
 from .tags import normalize_tag_text, slugify_tag
 
@@ -143,6 +147,11 @@ class ManagedTemplateService(Generic[TemplateContentType]):
     :param composer: the composer that does it. Defaults to one reading through
         ``template_manager_backend``, so composition resolves against the same store the
         service reads from rather than through whatever backend the renderer happens to hold.
+    :param allow_deleting_published_versions: when True, ``delete_template`` skips the deletion
+        rule and hands any version to the backend. Off by default: only a version that was
+        never published can be deleted. A backend that enforces the rule itself (the Django one
+        does, under an option of the same name) still refuses unless it is switched on there
+        too.
     """
 
     template_manager_backend: BaseTemplateManagerBackend
@@ -150,6 +159,7 @@ class ManagedTemplateService(Generic[TemplateContentType]):
     validate_status_transitions: bool
     compose_templates: bool
     composer: TemplateComposer
+    allow_deleting_published_versions: bool
 
     # Which status a version may move to, keyed by the status it is in now. Overridable on a
     # subclass for hosts with a different lifecycle. ARCHIVED is terminal: an archived version
@@ -177,12 +187,14 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         validate_status_transitions: bool = True,
         compose_templates: bool = True,
         composer: TemplateComposer | None = None,
+        allow_deleting_published_versions: bool = False,
     ) -> None:
         self.template_manager_backend = template_manager_backend
         self.template_renderer = template_renderer
         self.validate_status_transitions = validate_status_transitions
         self.compose_templates = compose_templates
         self.composer = composer or TemplateComposer.from_backend(template_manager_backend)
+        self.allow_deleting_published_versions = allow_deleting_published_versions
         self._capabilities_cache: dict[str, bool] | None = None
 
     # ------------------------------------------------------------------
@@ -204,7 +216,9 @@ class ManagedTemplateService(Generic[TemplateContentType]):
 
     def get_template(self, template_key: str, version: int | None = None) -> ManagedTemplate:
         """
-        Retrieves one version of a template. ``version=None`` returns the latest version.
+        Retrieves one version of a template. ``version=None`` returns the latest version,
+        whatever its status -- the editing view. Use ``get_active_template`` for what a send
+        renders.
 
         param template_key: str
         param version: int | None
@@ -212,6 +226,18 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
         """
         return self.template_manager_backend.get_template(template_key, version)
+
+    def get_active_template(self, template_key: str) -> ManagedTemplate:
+        """
+        Retrieves the version an unpinned send renders: the highest-numbered ACTIVE version.
+
+        param template_key: str
+        return: ManagedTemplate
+        raises ManagedTemplateNotFoundError: if the key does not exist.
+        raises ManagedTemplateNoActiveVersionError: if the key exists but no version of it is
+            ACTIVE.
+        """
+        return self.template_manager_backend.get_active_template(template_key)
 
     def update_template(
         self,
@@ -253,11 +279,29 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         """
         Deletes one version of a template, or its latest version when ``version`` is None.
 
+        Only a version that was never published can be deleted: still in DRAFT, with nothing
+        but DRAFT in its status history. A published version may have rendered a notification
+        that is pinned to it, and its history records who published it -- retire it with
+        ``archive`` instead. The status history is never deleted.
+
+        The version is resolved once, checked, and then that exact version is deleted, so a
+        version drafted in between is never the one removed.
+
         param template_key: str
         param version: int | None
         raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        raises ManagedTemplateDeletionNotAllowedError: if the version has been published and
+            ``allow_deleting_published_versions`` is off.
         """
-        self.template_manager_backend.delete_template(template_key, version)
+        template = self.get_template(template_key, version)
+        if not self.allow_deleting_published_versions:
+            assert_template_version_deletable(
+                template,
+                self.template_manager_backend.get_template_status_history(
+                    template_key, template.version
+                ),
+            )
+        self.template_manager_backend.delete_template(template_key, template.version)
 
     def get_template_versions(self, template_key: str) -> list[ManagedTemplate]:
         """
@@ -329,7 +373,9 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         Publishes one version of a template.
 
         Other versions of the same key that are already ACTIVE are left alone -- a key may hold
-        several active versions at once, and choosing between them is the host's call.
+        several active versions at once. An unpinned send renders the highest-numbered active
+        one, so activating an older version while a newer one is active does not change what
+        is sent.
 
         param template_key: str
         param version: int | None
@@ -1125,24 +1171,30 @@ class ManagedTemplateService(Generic[TemplateContentType]):
 
         The notification's ``body_template`` is the template key. Which version renders is
         decided in this order: the ``version`` argument, then the notification's own
-        ``requested_template_version``, then whatever the backend considers current.
+        ``requested_template_version``, then the key's newest ACTIVE version.
 
         The argument is there to render a version the notification is *not* pinned to --
         previewing an unpublished draft, or reproducing what an old notification looked like.
-        Leave it off and this renders what a real send would.
+        Leave it off and this renders what a real send would, except that a renderer's
+        registered fallback is never used: a key with nothing published raises.
 
         param notification: Notification | OneOffNotification
         param context: NotificationContextDict
         param version: int | None -- overrides the notification's own pin.
         return: NotificationSendInput
         raises ManagedTemplateNotFoundError: if the key (or that version of it) does not exist.
+        raises ManagedTemplateNoActiveVersionError: if no version is given or pinned and the key
+            has no ACTIVE version.
         raises ManagedTemplateCompositionError: if the template cannot be assembled.
         """
         if version is None:
             # getattr rather than an attribute read: the field arrived in vintasend 2.1, and
             # this service should keep working against a Notification that predates it.
             version = getattr(notification, "requested_template_version", None)
-        template = self.get_template(notification.body_template, version)
+        if version is None:
+            template = self.get_active_template(notification.body_template)
+        else:
+            template = self.get_template(notification.body_template, version)
         return self.render_template(notification, template, context)
 
     def render_template(

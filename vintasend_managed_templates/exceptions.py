@@ -10,6 +10,31 @@ class ManagedTemplateNotFoundError(ManagedTemplateError):
     pass
 
 
+class ManagedTemplateNoActiveVersionError(ManagedTemplateNotFoundError):
+    """Raised when a send resolves a key that has versions, but none of them is ACTIVE.
+
+    A subclass of ``ManagedTemplateNotFoundError`` on purpose: for a send, a key holding only
+    drafts (or only retired versions) has nothing published to render, which is the same
+    answer as a key with nothing stored. That is what lets a renderer's fallback treat a key
+    nobody has published yet as "not customized", and what lets an API keep mapping it to a
+    404. Catch this subclass to tell "exists but unpublished" apart from "never created".
+    """
+
+    pass
+
+
+class ManagedTemplateDeletionNotAllowedError(ManagedTemplateError):
+    """Raised when deleting a template version that the deletion rule protects.
+
+    Only a version that was never published can be deleted: one still in DRAFT whose status
+    history records nothing but DRAFT. Any other version may have rendered a notification that
+    is pinned to it, and its status history records who published it. Retire it with
+    ``archive`` instead. See ``lifecycle.is_template_version_deletable``.
+    """
+
+    pass
+
+
 class ManagedTemplateInvalidFilterError(ManagedTemplateError):
     """Raised when an invalid filter is used to filter ManagedTemplates."""
 

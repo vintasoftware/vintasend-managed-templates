@@ -85,6 +85,7 @@ def test_email_content_keeps_a_missing_preheader_as_none(service, email_renderer
 
 def test_email_render_resolves_the_key_through_the_backend(service, email_renderer):
     service.create_template(make_create_input("welcome"))
+    service.activate("welcome", 1)
 
     rendered = email_renderer.render(make_notification("welcome"), {"name": "Hugo"})
 
@@ -92,9 +93,11 @@ def test_email_render_resolves_the_key_through_the_backend(service, email_render
     assert rendered.subject == "Hello Hugo"
 
 
-def test_email_render_always_uses_the_backends_current_version(service, email_renderer):
+def test_email_render_uses_the_newest_active_version(service, email_renderer):
     service.create_template(make_create_input("welcome"))
     service.update_template("welcome", make_update_input(template_body="Hey {name}!"))
+    service.activate("welcome", 1)
+    service.activate("welcome", 2)
 
     # The renderer has no version argument -- that is exactly why the service exposes one.
     assert email_renderer.render(make_notification("welcome"), {"name": "Hugo"}).body == "Hey Hugo!"
@@ -107,6 +110,7 @@ def test_email_render_raises_for_an_unknown_key(email_renderer):
 
 def test_email_render_works_for_a_one_off_notification(service, email_renderer):
     service.create_template(make_create_input("welcome"))
+    service.activate("welcome", 1)
 
     rendered = email_renderer.render(make_one_off_notification("welcome"), {"name": "Ana"})
 
@@ -163,5 +167,6 @@ def test_sms_content_carries_only_the_body(service, sms_renderer):
 
 def test_sms_render_resolves_the_key_through_the_backend(service, sms_renderer):
     service.create_template(make_create_input("alert", template_body="Code {code}"))
+    service.activate("alert", 1)
 
     assert sms_renderer.render(make_notification("alert"), {"code": "123"}).body == "Code 123"

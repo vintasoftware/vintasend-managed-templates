@@ -38,6 +38,7 @@ from .fakes import (
     make_create_input,
     make_notification,
     make_update_input,
+    publish,
 )
 
 
@@ -751,6 +752,7 @@ def test_the_renderer_composes_before_it_hands_the_template_over(backend, inner_
             template_subject="Hello",
         )
     )
+    publish(backend, "welcome")
     renderer = ManagedTemplateEmailRenderer(backend, inner_renderer)
 
     email = renderer.render(make_notification("welcome"), {})
@@ -766,6 +768,7 @@ def test_a_renderer_told_not_to_compose_hands_the_source_over_as_stored(backend)
             template_subject="Hello",
         )
     )
+    publish(backend, "welcome")
     renderer = ManagedTemplateEmailRenderer(backend, EchoEmailRenderer(), compose_templates=False)
 
     email = renderer.render(make_notification("welcome"), {})
@@ -788,6 +791,7 @@ def test_a_renderer_can_be_given_its_own_composer(backend, inner_renderer, store
             "welcome", template_body='{% mt_extends "base" %}Hi', template_subject="Hello"
         )
     )
+    publish(backend, "welcome")
 
     assert renderer.render(make_notification("welcome"), {}).body == "<Hi>"
 
@@ -808,6 +812,7 @@ def test_the_service_composes_what_it_renders(service, backend):
             template_subject="Hello",
         )
     )
+    publish(backend, "welcome")
 
     email = service.render(make_notification("welcome"), {})
 
@@ -855,6 +860,7 @@ def test_a_service_told_not_to_compose_renders_the_source_as_stored(backend):
             template_subject="Hello",
         )
     )
+    publish(backend, "welcome")
 
     assert service.render(make_notification("welcome"), {}).body == (
         '{% managed_extends "base" %}Hi'
@@ -1061,9 +1067,11 @@ def test_a_malformed_version_is_refused(store, composer):
         composer.compose(template)
 
 
-def test_the_renderer_reports_the_latest_version_for_pinning(backend, inner_renderer):
+def test_the_renderer_reports_the_newest_active_version_for_pinning(backend, inner_renderer):
     backend.create_template(make_create_input("welcome"))
     backend.update_template("welcome", make_update_input(template_body="v2"))
+    publish(backend, "welcome", 1)
+    publish(backend, "welcome", 2)
     renderer = ManagedTemplateEmailRenderer(backend, inner_renderer)
 
     assert renderer.get_latest_template_version("welcome") == 2
@@ -1089,9 +1097,11 @@ def test_the_renderer_honours_the_version_a_notification_is_pinned_to(backend, i
     assert email.template_version == 1
 
 
-def test_an_unpinned_notification_renders_the_current_version(backend, inner_renderer):
+def test_an_unpinned_notification_renders_the_newest_active_version(backend, inner_renderer):
     backend.create_template(make_create_input("welcome", template_body="v1", template_subject="s"))
     backend.update_template("welcome", make_update_input(template_body="v2"))
+    publish(backend, "welcome", 1)
+    publish(backend, "welcome", 2)
     renderer = ManagedTemplateEmailRenderer(backend, inner_renderer)
 
     email = renderer.render(make_notification("welcome"), {})
