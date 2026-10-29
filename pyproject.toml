@@ -32,7 +32,7 @@ tox = "^4.55.0"
 # Makes the [gh] section in tox.ini effective: each CI job then runs only the
 # envs mapped to its interpreter instead of every env it can find one for.
 tox-gh = "^1.8.0"
-ruff = "^0.15.22"
+ruff = "^0.17.3"
 mypy = "^2.3.0"
 pytest-cov = "^7.1.0"
 
@@ -46,6 +46,11 @@ indent-width = 4
 # Must track the MINIMUM Python this template supports. Setting this higher lets
 # pyupgrade rewrite code into syntax that breaks older interpreters.
 target-version = "py310"
+
+[tool.ruff.format]
+# Ruff 0.17 formats the Python code blocks in Markdown files by default. Leave docs as
+# written; the formatter is for the package source.
+exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = [
