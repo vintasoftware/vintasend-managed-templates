@@ -1,7 +1,7 @@
 [project]
 name = "vintasend-managed-templates"
 version = "3.6.0"
-description = "Starting point for a new vintasend-* implementation package: one TODO stub per seam, ready to clone."
+description = "Database-backed notification templates for VintaSend, with versioning and a draft/active/inactive/archived lifecycle"
 authors = [{ name = "Hugo Bessa", email = "hugo@vinta.com.br" }]
 license = "MIT"
 readme = "README.md"
