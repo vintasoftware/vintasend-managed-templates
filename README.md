@@ -100,7 +100,8 @@ an inner renderer as constructor arguments, which a string path cannot supply.
 
 Nothing else about creating or sending notifications changes. A send renders the key's newest
 **active** version -- see [Which version a send renders](#which-version-a-send-renders) -- so a
-template has to be activated before it goes out.
+template has to be activated before it goes out, and so do the bases and fragments it composes
+(see [Versions](#versions)).
 
 ### Sending before a template is written: fallbacks
 
@@ -304,12 +305,9 @@ Neither the check nor the flag refuses anything — keeping bases out of a picke
 
 ### Versions
 
-A reference with no version resolves the same way any other read does: to whatever version that key
-currently is. Pin it when a template must keep composing against an exact parent — re-rendering an
-old notification resolves the child's version explicitly, but its unpinned bases still resolve to
-today's.
-
-`version=N` is the only spelling, on both tags that take a reference:
+Pin a reference when a template must keep composing against an exact parent — re-rendering an old
+notification resolves the child's version explicitly, but its unpinned bases still resolve to
+today's. `version=N` is the only spelling, on both tags that take a reference:
 
 ```
 {% managed_extends "base-email" version=2 %}
@@ -318,6 +316,55 @@ today's.
 
 Nothing inside the quoted key is interpreted, so a key is only ever a key — a template genuinely
 named `base-email[v2]` is referenced exactly as written, with no escaping and no special case.
+
+A reference with **no** version resolves one of two ways:
+
+| `parts` | An unpinned part resolves to | Used by default by |
+|---|---|---|
+| `"latest"` | its newest version, drafts included | `ManagedTemplateService`'s composer: `get_composed_template`, `validate_composition`, `render_template`, `service.render` |
+| `"published"` | its newest **`ACTIVE`** version | `ManagedTemplateRenderer`'s composer: every send, through `renderer.render` |
+
+So an editor sees the draft base someone is working on, and a recipient never does: a send applies
+the same rule to its parts that it applies to the notification's own key. A part with nothing
+published fails a send with `ManagedTemplateCompositionReferenceError` ("... which has no active
+version"), so **activate your bases and fragments**, not only the templates that extend them. A
+registered [fallback](#sending-before-a-template-is-written-fallbacks) does not cover this: the
+template exists and is broken, and a default must not hide that.
+
+To keep composing sends against the newest parts whatever their status, as earlier releases did,
+build the renderer with `composer_parts="latest"`:
+
+```python
+renderer = ManagedTemplateEmailRenderer(manager_backend, inner_renderer, composer_parts="latest")
+```
+
+`composer_parts` configures the renderer's default composer. A `composer=` you pass yourself
+resolves parts however it was built, and `TemplateComposer.from_backend` defaults to `"latest"`.
+
+### Previews: rendering without a notification
+
+You do not need two composers to get "preview with drafts, send with published". Pick the rule per
+call with `render_standalone`, which renders a template with no notification:
+
+```python
+template = service.get_template("welcome")    # or an edited copy not saved yet
+preview = service.render_standalone(template, sample_context, parts="latest")
+as_sent = service.render_standalone(template, sample_context, parts="published")
+preview.body, preview.subject                  # the inner renderer's send input
+preview.template_version                       # the template's version
+```
+
+`parts` is required, so every caller says which rule it means. The service composes with its own
+composer (tag prefix, depth limit, backend and `compose_templates`); `renderer.render_standalone`
+does the same with the renderer's. Either way the inner renderer is handed
+`standalone_notification(template)`, a placeholder `Notification` with no ID and no recipient:
+only `body_template` (the key) and `requested_template_version` are set, and every renderer
+shipped with vintasend needs nothing else to render content.
+
+To build a composer yourself, `TemplateComposer.from_backend(backend, parts=...)` takes the same
+option, `composition.part_resolver(backend, parts)` is the resolver on its own, and
+`composer.with_resolver(resolver)` returns a copy of an existing composer (tag prefix, depth limit
+and subclass kept) that resolves through another one.
 
 ### Checking a template before it ships
 
@@ -333,11 +380,32 @@ service.get_template_references(template)  # the bases and fragments it names, u
 | Exception | Raised when |
 |---|---|
 | `ManagedTemplateCompositionSyntaxError` | A tag is malformed, unknown, or unbalanced |
-| `ManagedTemplateCompositionReferenceError` | A base or fragment does not exist (also a `ManagedTemplateNotFoundError`) |
+| `ManagedTemplateCompositionReferenceError` | A base or fragment does not exist, or, under `"published"`, has no active version (also a `ManagedTemplateNotFoundError`) |
 | `ManagedTemplateCompositionCycleError` | The references loop |
 | `ManagedTemplateCompositionDepthError` | The chain runs past the composer's `max_depth` (25 by default) |
 
 All four subclass `ManagedTemplateCompositionError`.
+
+`validate_composition` and `get_composed_template` use the service's composer, so they resolve
+parts as `"latest"`: they tell you the template assembles, not that a send would. To refuse to
+publish a version that a send could not render, let `activate` check it first:
+
+```python
+from vintasend_managed_templates.managed_template_service import RenderCheck
+
+service.activate("welcome", 3, "ana", check_render=RenderCheck(context=sample_context))
+```
+
+The check renders version 3 the way a send would: parts at their newest published versions,
+through the renderer's composer and inner renderer. If that raises, **nothing is written** — the
+version keeps its status and no status history entry is created — and `activate` raises
+`ManagedTemplateRenderCheckError`, with the render failure chained as `__cause__` and
+`template_key` and `version` on it. Its message names the key, the version and the cause's class,
+never the context, and `RenderCheck`'s repr leaves the context out too.
+`set_status(key, ManagedTemplateStatus.ACTIVE, version, changed_by, check_render=...)` does the
+same. Passing `check_render` with any other status raises `ValueError` before anything is read or
+written. A version already active is returned as it is, unchecked, and a move the transition table
+refuses raises `ManagedTemplateStatusTransitionError` before anything renders.
 
 ### Turning it off
 
@@ -386,7 +454,7 @@ the editing view, which includes a draft someone is working on. Sends are the ex
 | | Resolves to | Used by |
 |---|---|---|
 | The editing view | the newest version, whatever its status | `get_template(key)`, status changes, tagging, the API's reads |
-| The send path | the newest **`ACTIVE`** version | `render` on an unpinned notification, `service.render` with no version and no pin, `get_latest_template_version` |
+| The send path | the newest **`ACTIVE`** version | `render` on an unpinned notification, `service.render` with no version and no pin, `get_current_template_version` / `get_latest_template_version` (which also skip a base) |
 
 A draft is never sent: publishing is the deliberate act that puts a version in front of
 recipients. When several versions of a key are active at once, the **highest-numbered** active
@@ -441,7 +509,9 @@ The default transition table:
 | `ARCHIVED` | — terminal |
 
 Anything else raises `ManagedTemplateStatusTransitionError`. Setting a version to the status it
-already holds is a no-op: no history entry, no error. Override `ALLOWED_STATUS_TRANSITIONS` on a
+already holds is a no-op: no history entry, no error. `activate` and `set_status` can render the
+version before publishing it, and refuse without writing anything when it does not render: see
+[Checking a template before it ships](#checking-a-template-before-it-ships). Override `ALLOWED_STATUS_TRANSITIONS` on a
 subclass for a different lifecycle, or pass `validate_status_transitions=False` to leave the
 ordering entirely to your application.
 
@@ -613,8 +683,10 @@ service.render_template(notification, template, context)   # a template already 
 
 The argument is for rendering a version the notification is *not* pinned to -- previewing an
 unpublished draft, or reproducing what an old notification looked like. Leave it off and you get
-what a real send would produce, except that a renderer's registered fallback is never used: a key
-with nothing published raises.
+the version a real send would render, with two differences: a renderer's registered fallback is
+never used (a key with nothing published raises), and the service's composer resolves unpinned
+bases and fragments as `"latest"`. `render_standalone(template, context, parts="published")` shows
+exactly what a send would produce.
 
 ### Pinning a notification to a version
 
@@ -639,10 +711,28 @@ notification_service = NotificationService(..., pin_template_versions=True)
 ```
 
 With `pin_template_versions=True`, the service asks this package's renderer which version to pin
-through `get_latest_template_version()`, which answers the key's newest active version: the same
-version an unpinned send would render, so a draft is never pinned. A key with nothing published
-answers `None` and the notification is created unpinned, rather than failing the creation over a
-template that may well be published by the time it is sent.
+through `get_latest_template_version()`, which answers the same as `get_current_template_version()`
+below: never a draft, never a base. A key with nothing published answers `None` and the
+notification is created unpinned, rather than failing the creation over a template that may well
+be published by the time it is sent.
+
+### The version new notifications get
+
+```python
+service.get_current_template_version("welcome")   # or renderer.get_current_template_version
+```
+
+answers the key's newest active version, or `None` when nothing is published **or that version is
+abstract** — a base is built on, not sent. Abstractness is read off the source with the renderer's
+composer (see [Abstract templates](#abstract-templates)). A renderer built with
+`compose_templates=False` treats nothing as a base, and a source too malformed to parse counts as
+sendable, so its send reports the syntax error.
+
+It is the one function behind every "current version": the renderer's
+`get_latest_template_version` returns it, and vintasend calls that for
+`NotificationService.get_current_template_version`, `pin_template_versions` and
+`repin_notification` without a version. A dashboard showing "the version new notifications get"
+and the library re-pinning to it cannot disagree, and a notification is never pinned to a base.
 
 Whichever version renders is reported back on the send input as `template_version`, so vintasend
 can store it as `used_template_version`. For an unpinned notification that is the only record of
@@ -722,6 +812,7 @@ All of them subclass `ManagedTemplateError`:
 | `ManagedTemplateDeletionNotAllowedError` | Deleting a version that has been published -- archive it instead |
 | `ManagedTemplateInvalidFilterError` | A filter is malformed or names an unknown field |
 | `ManagedTemplateStatusTransitionError` | The status move is not allowed from the current status |
+| `ManagedTemplateRenderCheckError` | `activate` / `set_status` was given `check_render` and the version did not render. Nothing was written; the failure is `__cause__` |
 | `ManagedTemplateChangeUserNotFoundError` | An update names a `changed_by` user that does not exist |
 | `ManagedTemplateTagNotFoundError` | No tag has that slug |
 | `ManagedTemplateTagAlreadyExistsError` | `create_tag` collides with an existing slug |

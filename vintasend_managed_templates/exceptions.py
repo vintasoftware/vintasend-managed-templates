@@ -68,6 +68,24 @@ class ManagedTemplateStatusTransitionError(ManagedTemplateError):
     pass
 
 
+class ManagedTemplateRenderCheckError(ManagedTemplateError):
+    """Raised when a version was asked to pass a render check before it was activated, and did not.
+
+    Nothing was written: the version keeps its status, and no status history entry records the
+    attempt. The failure itself is ``__cause__`` -- a composition error, the engine's own error,
+    or anything else rendering raised -- and the message names the key, the version and the
+    cause's class only, never the context it was rendered with.
+    """
+
+    def __init__(self, template_key: str, version: int, cause: BaseException) -> None:
+        super().__init__(
+            f"Template '{template_key}' v{version} failed its render check "
+            f"({type(cause).__name__}), so it was not activated."
+        )
+        self.template_key = template_key
+        self.version = version
+
+
 class ManagedTemplateTagNotFoundError(ManagedTemplateError):
     """Raised when a ManagedTemplateTag is not found in the backend."""
 
