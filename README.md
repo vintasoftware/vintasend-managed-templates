@@ -321,8 +321,8 @@ A reference with **no** version resolves one of two ways:
 
 | `parts` | An unpinned part resolves to | Used by default by |
 |---|---|---|
-| `"latest"` | its newest version, drafts included | `ManagedTemplateService`'s composer: `get_composed_template`, `validate_composition`, `render_template`, `service.render` |
-| `"published"` | its newest **`ACTIVE`** version | `ManagedTemplateRenderer`'s composer: every send, through `renderer.render` |
+| `"latest"` | its newest version, drafts included | `ManagedTemplateService`'s composer: `get_composed_template`, `validate_composition`, `render_template` |
+| `"published"` | its newest **`ACTIVE`** version | `ManagedTemplateRenderer`'s composer: every send, through `renderer.render`, and `service.render` |
 
 So an editor sees the draft base someone is working on, and a recipient never does: a send applies
 the same rule to its parts that it applies to the notification's own key. A part with nothing
@@ -396,11 +396,12 @@ from vintasend_managed_templates.managed_template_service import RenderCheck
 service.activate("welcome", 3, "ana", check_render=RenderCheck(context=sample_context))
 ```
 
-The check renders version 3 the way a send would: parts at their newest published versions,
-through the renderer's composer and inner renderer. If that raises, **nothing is written** — the
-version keeps its status and no status history entry is created — and `activate` raises
-`ManagedTemplateRenderCheckError`, with the render failure chained as `__cause__` and
-`template_key` and `version` on it. Its message names the key, the version and the cause's class,
+The check renders version 3 with its bases and fragments at their newest published versions,
+through the renderer's composer and inner renderer. It always resolves parts as `"published"`, so
+a renderer built with `composer_parts="latest"` or a custom composer sends against other parts
+than the check uses. If that raises, **nothing is written** — the version keeps its status and no
+status history entry is created — and `activate` raises `ManagedTemplateRenderCheckError`, with
+the render failure chained as `__cause__` and `template_key` and `version` on it. Its message names the key, the version and the cause's class,
 never the context, and `RenderCheck`'s repr leaves the context out too.
 `set_status(key, ManagedTemplateStatus.ACTIVE, version, changed_by, check_render=...)` does the
 same. Passing `check_render` with any other status raises `ValueError` before anything is read or
@@ -683,10 +684,12 @@ service.render_template(notification, template, context)   # a template already 
 
 The argument is for rendering a version the notification is *not* pinned to -- previewing an
 unpublished draft, or reproducing what an old notification looked like. Leave it off and you get
-the version a real send would render, with two differences: a renderer's registered fallback is
-never used (a key with nothing published raises), and the service's composer resolves unpinned
-bases and fragments as `"latest"`. `render_standalone(template, context, parts="published")` shows
-exactly what a send would produce.
+what a real send would render, except that a renderer's registered fallback is never used: a key
+with nothing published raises. `service.render` composes through the renderer, as a send does, so
+an unpinned base or fragment resolves the way the renderer's composer resolves it (`"published"`
+by default) whichever version of the notification's own template renders. `render_template` uses
+the service's composer, and `render_standalone(template, context, parts="latest")` previews draft
+parts.
 
 ### Pinning a notification to a version
 

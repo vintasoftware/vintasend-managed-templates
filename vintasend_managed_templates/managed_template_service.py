@@ -38,11 +38,14 @@ What the service adds on top of the raw backend:
   is stored, and ``get_composed_template`` is the explicit way to ask for the assembled form.
   The service's own composer resolves a part named without ``version=`` to its newest version,
   drafts included (``parts="latest"``): the editing view. The renderer's composer, which every
-  send goes through, resolves it to its newest ACTIVE version instead. ``render_standalone``
+  send and ``render`` go through, resolves it to its newest ACTIVE version instead. ``render_standalone``
   takes either per call.
 * **Render checks on publish.** ``activate`` and ``set_status`` take
-  ``check_render=RenderCheck(context)``, which renders the version as a send would before
-  anything is written, and refuses with ``ManagedTemplateRenderCheckError`` when it fails.
+  ``check_render=RenderCheck(context)``, which renders the version with its bases and
+  fragments at their newest published versions before anything is written, and refuses with
+  ``ManagedTemplateRenderCheckError`` when it fails. A renderer built with
+  ``composer_parts="latest"`` or a custom composer sends against other parts than the check
+  uses.
 
 Two deliberate non-policies, both chosen so the service stays a thin orchestration layer:
 
@@ -136,7 +139,12 @@ _FLAG_FILTER_FIELDS: frozenset[str] = frozenset({"most_recent_active_version", "
 
 @dataclasses.dataclass(frozen=True)
 class RenderCheck:
-    """Render a version against ``context`` before activating it, as a send would render it.
+    """Render a version against ``context`` before activating it.
+
+    The version renders with its bases and fragments at their newest published versions,
+    through the renderer's composer and inner renderer. A renderer built with
+    ``composer_parts="latest"`` or a custom composer sends against other parts than the check
+    uses.
 
     Passed as ``check_render`` to ``ManagedTemplateService.activate`` or ``set_status``. When
     the render raises, the version is not activated and nothing is written. Only for a move to
@@ -434,10 +442,12 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         one, so activating an older version while a newer one is active does not change what
         is sent.
 
-        Pass ``check_render=RenderCheck(context)`` to render the version first, the way a send
-        would: its parts resolved to their newest published versions, through the renderer's
-        composer and inner renderer. If that raises, the version is not activated and nothing
-        is written; ``ManagedTemplateRenderCheckError`` carries the failure as ``__cause__``.
+        Pass ``check_render=RenderCheck(context)`` to render the version first, with its bases
+        and fragments at their newest published versions, through the renderer's composer and
+        inner renderer. A renderer built with ``composer_parts="latest"`` or a custom composer
+        sends against other parts than the check uses. If that raises, the version is not
+        activated and nothing is written; ``ManagedTemplateRenderCheckError`` carries the
+        failure as ``__cause__``.
 
         param template_key: str
         param version: int | None
@@ -456,7 +466,7 @@ class ManagedTemplateService(Generic[TemplateContentType]):
         )
 
     def _check_render(self, template: ManagedTemplate, context: "NotificationContextDict") -> None:
-        """Render ``template`` as a send would, or raise ``ManagedTemplateRenderCheckError``."""
+        """Render ``template`` with published parts, or raise ``ManagedTemplateRenderCheckError``."""
         try:
             self.template_renderer.render_standalone(template, context, parts="published")
         except Exception as error:
@@ -1313,11 +1323,17 @@ class ManagedTemplateService(Generic[TemplateContentType]):
 
         The argument is there to render a version the notification is *not* pinned to --
         previewing an unpublished draft, or reproducing what an old notification looked like.
-        Leave it off and this renders the version a real send would, with two differences: a
-        renderer's registered fallback is never used (a key with nothing published raises),
-        and the template is composed by this service's composer, so a base or fragment named
-        without ``version=`` resolves to its newest version, drafts included. Use
-        ``render_standalone(..., parts="published")`` to see exactly what a send would render.
+        Leave it off and this renders what a real send would, except that a renderer's
+        registered fallback is never used: a key with nothing published raises.
+
+        The template is looked up and composed by the renderer, not by this service: through
+        the renderer's backend, its composer and its ``compose_templates`` setting, exactly as
+        a send composes it. So a base or fragment named without ``version=`` resolves the way
+        the renderer's sends resolve it -- its newest ACTIVE version by default, or its newest
+        version if the renderer was built with ``composer_parts="latest"`` -- whichever version
+        of the notification's own template renders. ``render_template``,
+        ``get_composed_template`` and ``validate_composition`` use this service's composer
+        instead, and ``render_standalone(..., parts="latest")`` previews draft parts.
 
         param notification: Notification | OneOffNotification
         param context: NotificationContextDict
@@ -1332,11 +1348,16 @@ class ManagedTemplateService(Generic[TemplateContentType]):
             # getattr rather than an attribute read: the field arrived in vintasend 2.1, and
             # this service should keep working against a Notification that predates it.
             version = getattr(notification, "requested_template_version", None)
+        renderer = self.template_renderer
         if version is None:
-            template = self.get_active_template(notification.body_template)
+            template = renderer.get_active_template(notification.body_template)
         else:
-            template = self.get_template(notification.body_template, version)
-        return self.render_template(notification, template, context)
+            template = renderer.manager_backend.get_template(notification.body_template, version)
+        send_input = renderer.render_from_template_content(
+            notification, renderer.create_template_content(renderer.compose(template)), context
+        )
+        send_input.template_version = template.version
+        return send_input
 
     def render_template(
         self,

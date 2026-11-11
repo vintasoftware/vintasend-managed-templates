@@ -816,6 +816,8 @@ def test_the_service_composes_what_it_renders(service, backend):
             template_subject="Hello",
         )
     )
+    # ``service.render`` composes through the renderer, as a send does: published parts only.
+    publish(backend, "base")
     publish(backend, "welcome")
 
     email = service.render(make_notification("welcome"), {})
@@ -866,8 +868,12 @@ def test_a_service_told_not_to_compose_renders_the_source_as_stored(backend):
     )
     publish(backend, "welcome")
 
-    assert service.render(make_notification("welcome"), {}).body == (
-        '{% managed_extends "base" %}Hi'
+    # ``render_template`` is the service's own render; ``service.render`` follows the renderer.
+    assert (
+        service.render_template(
+            make_notification("welcome"), service.get_template("welcome"), {}
+        ).body
+        == '{% managed_extends "base" %}Hi'
     )
 
 

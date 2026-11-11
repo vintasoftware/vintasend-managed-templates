@@ -268,9 +268,10 @@ class ManagedTemplateRenderer(
     def get_latest_template_version(self, template_key: str) -> int | None:
         """The renderer seam vintasend asks when it pins: ``get_current_template_version``.
 
-        ``NotificationService.get_current_template_version``, ``pin_template_versions`` and
-        ``repin_notification`` without a version all reach this, so what a dashboard shows as
-        "the version new notifications get" is what they pin.
+        vintasend's ``pin_template_versions`` reaches this, and so do ``repin_notification``
+        without a version and ``NotificationService.get_current_template_version`` once they
+        arrive in vintasend 3.8.0, so what a dashboard shows as "the version new notifications
+        get" is what they pin.
 
         param template_key: str
         return: int | None

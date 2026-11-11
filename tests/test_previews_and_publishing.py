@@ -4,19 +4,21 @@
   drafts included, under ``"latest"`` (previews, and the service's own composer), and to its
   newest ACTIVE version under ``"published"`` (every send, through the renderer's composer).
 * **``render_standalone``** renders a template with no notification, under either rule.
-* **The render check** on ``activate`` / ``set_status`` renders the version as a send would
-  before anything is written, and writes nothing when it fails.
+* **The render check** on ``activate`` / ``set_status`` renders the version with its bases and
+  fragments at their newest published versions before anything is written, and writes nothing
+  when it fails.
 * **``get_current_template_version``** is the newest active version unless that is a base, and
   ``get_latest_template_version`` -- what vintasend pins with -- answers the same.
 """
 
 import dataclasses
+import datetime
 
 import pytest
 from vintasend.services.dataclasses import Notification
 from vintasend.services.notification_adapters.stubs.fake_adapter import FakeEmailAdapter
 from vintasend.services.notification_backends.stubs.fake_backend import FakeFileBackend
-from vintasend.services.notification_service import NotificationService, register_context
+from vintasend.services.notification_service import NotificationService
 
 from vintasend_managed_templates.composition import TemplateComposer, part_resolver
 from vintasend_managed_templates.constants import ManagedTemplateStatus
@@ -232,6 +234,36 @@ def test_a_renderer_given_its_own_composer_resolves_parts_as_that_composer_does(
 def test_the_services_own_composer_still_resolves_latest(base_active_v1_draft_v2, service):
     assert service.get_composed_template("welcome").body_template == "((draft Hi {name}))"
     service.validate_composition(service.get_template("welcome"))
+
+
+def test_service_render_composes_published_parts_and_a_latest_preview_finds_the_draft(
+    base_active_v1_draft_v2, backend, service
+):
+    """``service.render`` composes through the renderer, as a send does; a preview opts in."""
+    publish(backend, "welcome")
+    template = service.get_template("welcome")
+
+    assert service.render(make_notification("welcome"), {"name": "Ana"}).body == "[[Hi Ana]]"
+    assert service.render(make_notification("welcome"), {"name": "Ana"}, version=1).body == (
+        "[[Hi Ana]]"
+    )
+    pinned = dataclasses.replace(make_notification("welcome"), requested_template_version=1)
+    assert service.render(pinned, {"name": "Ana"}).body == "[[Hi Ana]]"
+    assert service.render_standalone(template, {"name": "Ana"}, parts="latest").body == (
+        "((draft Hi Ana))"
+    )
+
+
+def test_service_render_follows_a_renderer_built_to_compose_latest_parts(
+    base_active_v1_draft_v2, backend, inner_renderer
+):
+    publish(backend, "welcome")
+    renderer = ManagedTemplateEmailRenderer(backend, inner_renderer, composer_parts="latest")
+    service = ManagedTemplateService(backend, renderer)
+
+    assert service.render(make_notification("welcome"), {"name": "Ana"}).body == (
+        "((draft Hi Ana))"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -536,7 +568,6 @@ def test_an_active_version_too_malformed_to_parse_is_current(backend, email_rend
 def test_vintasend_never_pins_a_notification_to_a_base(
     current_versions, backend, email_renderer, tmp_path
 ):
-    register_context("managed_templates_current_version_test")(lambda: {"name": "Ana"})
     notification_backend = FakeFileBackend(database_file_name=str(tmp_path / "notifications.json"))
     notifications = NotificationService(
         notification_adapters=[
@@ -544,6 +575,20 @@ def test_vintasend_never_pins_a_notification_to_a_base(
         ],
         notification_backend=notification_backend,
     )
+    # Scheduled, so creating one does not send it and no context has to be registered.
+    tomorrow = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
 
-    assert notifications.get_current_template_version("EMAIL", "welcome") == 1
-    assert notifications.get_current_template_version("EMAIL", "base") is None
+    def create(body_template: str) -> Notification:
+        return notifications.create_notification(
+            user_id=1,
+            notification_type="EMAIL",
+            title="t",
+            body_template=body_template,
+            context_name="unused",
+            context_kwargs={},
+            send_after=tomorrow,
+            pin_template_versions=True,
+        )
+
+    assert create("welcome").requested_template_version == 1
+    assert create("base").requested_template_version is None
