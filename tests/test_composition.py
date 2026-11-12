@@ -752,6 +752,7 @@ def test_the_renderer_composes_before_it_hands_the_template_over(backend, inner_
             template_subject="Hello",
         )
     )
+    publish(backend, "base")
     publish(backend, "welcome")
     renderer = ManagedTemplateEmailRenderer(backend, inner_renderer)
 
@@ -777,9 +778,12 @@ def test_a_renderer_told_not_to_compose_hands_the_source_over_as_stored(backend)
 
 
 def test_the_renderer_composes_through_its_own_backend(backend, inner_renderer):
+    backend.create_template(make_create_input("base", template_body="[[{% managed_children %}]]"))
+    publish(backend, "base")
     renderer = ManagedTemplateEmailRenderer(backend, inner_renderer)
 
-    assert renderer.composer.resolve_template == backend.get_template
+    assert renderer.composer.resolve_template is not None
+    assert renderer.composer.resolve_template("base", None).version == 1
 
 
 def test_a_renderer_can_be_given_its_own_composer(backend, inner_renderer, store):
@@ -812,6 +816,8 @@ def test_the_service_composes_what_it_renders(service, backend):
             template_subject="Hello",
         )
     )
+    # ``service.render`` composes through the renderer, as a send does: published parts only.
+    publish(backend, "base")
     publish(backend, "welcome")
 
     email = service.render(make_notification("welcome"), {})
@@ -862,8 +868,12 @@ def test_a_service_told_not_to_compose_renders_the_source_as_stored(backend):
     )
     publish(backend, "welcome")
 
-    assert service.render(make_notification("welcome"), {}).body == (
-        '{% managed_extends "base" %}Hi'
+    # ``render_template`` is the service's own render; ``service.render`` follows the renderer.
+    assert (
+        service.render_template(
+            make_notification("welcome"), service.get_template("welcome"), {}
+        ).body
+        == '{% managed_extends "base" %}Hi'
     )
 
 

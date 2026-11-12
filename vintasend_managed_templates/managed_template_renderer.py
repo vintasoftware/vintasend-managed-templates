@@ -11,6 +11,11 @@ the engine sees: it gets one flat string. Composition is on by default and can b
 per renderer with ``compose_templates=False``, which is the right call only if a store predates
 composition and holds ``managed_``-prefixed text meant to be passed through.
 
+A part a template names without ``version=`` composes as that part's newest **ACTIVE** version,
+the same rule the notification's own key follows, so a draft base never reaches a recipient.
+``render_standalone`` renders a template with no notification and takes the rule per call:
+``"published"`` for what a send would show, ``"latest"`` for an editor's preview of drafts.
+
 Which version a send renders
 ----------------------------
 
@@ -55,6 +60,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Generic, TypeVar
 
+from vintasend.services.dataclasses import Notification
 from vintasend.services.notification_template_renderers.base import (
     BaseNotificationTemplateRenderer,
     NotificationSendInput,
@@ -65,17 +71,13 @@ from vintasend.services.notification_template_renderers.base_templated_email_ren
 )
 
 from .base_template_manager_backend import BaseTemplateManagerBackend
-from .composition import TemplateComposer
+from .composition import TemplateComposer, TemplatePartResolution, part_resolver
 from .dataclasses import ManagedTemplate
-from .exceptions import ManagedTemplateNotFoundError
+from .exceptions import ManagedTemplateCompositionSyntaxError, ManagedTemplateNotFoundError
 
 
 if TYPE_CHECKING:
-    from vintasend.services.dataclasses import (
-        Notification,
-        NotificationContextDict,
-        OneOffNotification,
-    )
+    from vintasend.services.dataclasses import NotificationContextDict, OneOffNotification
 
 
 logger = logging.getLogger(__name__)
@@ -116,6 +118,34 @@ class ManagedTemplateFallback(Generic[TemplateContentType]):
     renderer: "BaseNotificationTemplateRenderer[TemplateContentType] | None" = None
 
 
+def standalone_notification(template: ManagedTemplate) -> Notification:
+    """The notification ``render_standalone`` hands the inner renderer.
+
+    Nothing but where the template came from: ``body_template`` is the key and
+    ``requested_template_version`` the version. Every other field is empty -- no ID, no
+    recipient, no context name or parameters -- so nothing about a real notification can reach
+    a log line the inner renderer writes. Every renderer shipped with vintasend reads nothing
+    else from it when rendering content.
+
+    param template: ManagedTemplate
+    return: Notification
+    """
+    return Notification(
+        id="",
+        user_id="",
+        notification_type="",
+        title="",
+        body_template=template.key,
+        context_name="",
+        context_kwargs={},
+        send_after=None,
+        subject_template="",
+        preheader_template="",
+        status="",
+        requested_template_version=template.version,
+    )
+
+
 class ManagedTemplateRenderer(
     Generic[TemplateContentType], BaseNotificationTemplateRenderer[TemplateContentType], ABC
 ):
@@ -126,6 +156,8 @@ class ManagedTemplateRenderer(
         compose_templates: bool = True,
         composer: TemplateComposer | None = None,
         fallback: ManagedTemplateFallback[TemplateContentType] | None = None,
+        *,
+        composer_parts: TemplatePartResolution = "published",
     ):
         """
         :param template_manager_backend: where the template behind a key is read from.
@@ -133,16 +165,24 @@ class ManagedTemplateRenderer(
             template source in the ``body_template`` field rather than a loadable name.
         :param compose_templates: when True (the default), ``managed_*`` inheritance and
             inclusion tags are resolved before the inner renderer sees the template.
-        :param composer: the composer to resolve them with. Defaults to one reading through
-            ``template_manager_backend``; pass your own to change the tag prefix or the depth
-            limit.
+        :param composer: the composer sends resolve them with. Defaults to one reading through
+            ``template_manager_backend`` with ``parts=composer_parts``. Pass your own to change
+            the tag prefix or the depth limit; it then resolves parts however it was built
+            (``TemplateComposer.from_backend`` defaults to ``"latest"``).
         :param fallback: defaults to send for keys that have nothing published yet. See the
             module docstring for exactly when one is used.
+        :param composer_parts: how the default composer resolves a part named without
+            ``version=``. ``"published"`` (the default) composes it as its newest ACTIVE
+            version, the rule the notification's own key follows, so a draft base never
+            reaches a recipient. ``"latest"`` composes sends against draft parts, as earlier
+            releases did. Ignored when ``composer`` is given.
         """
         self.manager_backend = template_manager_backend
         self.renderer = template_renderer
         self.compose_templates = compose_templates
-        self.composer = composer or TemplateComposer.from_backend(template_manager_backend)
+        self.composer = composer or TemplateComposer.from_backend(
+            template_manager_backend, parts=composer_parts
+        )
         self.fallback = fallback
         self._fallback_templates: dict[str, FallbackTemplate] = (
             dict(fallback.templates) if fallback is not None else {}
@@ -201,23 +241,94 @@ class ManagedTemplateRenderer(
             notification, template_content, context, **kwargs
         )
 
-    def get_latest_template_version(self, template_key: str) -> int | None:
-        """The version a notification created now is pinned to: the key's newest ACTIVE version.
+    def get_current_template_version(self, template_key: str) -> int | None:
+        """The version new notifications get: the key's newest ACTIVE version, unless it is a base.
 
         The same version ``render`` would resolve to if the notification were left unpinned,
-        so a draft is never pinned. A key with nothing published -- no versions, or only
-        drafts and retired ones -- answers None rather than raising: a missing template is
-        the send's problem to report, and failing here would fail the *creation* of a
-        notification over a template that might well be published by the time it is sent.
-        A registered fallback does not change that answer: there is no stored version to pin.
+        so a draft is never returned. None when the key has nothing published -- no versions,
+        or only drafts and retired ones -- and when its newest active version is abstract (a
+        layout with a ``{% managed_children %}`` hole or unextended blocks), which is built on
+        rather than sent. Abstractness is read off the source with this renderer's composer;
+        with ``compose_templates=False`` nothing is abstract.
+
+        Never raises for a missing key: a missing template is the send's problem to report,
+        and failing here would fail the *creation* of a notification over a template that
+        might well be published by the time it is sent. A registered fallback does not change
+        the answer: there is no stored version to pin.
 
         param template_key: str
         return: int | None
         """
         try:
-            return self.get_active_template(template_key).version
+            template = self.get_active_template(template_key)
         except ManagedTemplateNotFoundError:
             return None
+        return template.version if self._is_sendable(template) else None
+
+    def get_latest_template_version(self, template_key: str) -> int | None:
+        """The renderer seam vintasend asks when it pins: ``get_current_template_version``.
+
+        vintasend's ``pin_template_versions`` reaches this, and so do ``repin_notification``
+        without a version and ``NotificationService.get_current_template_version`` once they
+        arrive in vintasend 3.8.0, so what a dashboard shows as "the version new notifications
+        get" is what they pin.
+
+        param template_key: str
+        return: int | None
+        """
+        return self.get_current_template_version(template_key)
+
+    def _is_sendable(self, template: ManagedTemplate) -> bool:
+        """Whether a template is one to send rather than a base.
+
+        A source too malformed to parse is not abstract, as a backend stores it: its send
+        fails with the syntax error, where it is reported.
+        """
+        if not self.compose_templates:
+            return True
+        try:
+            return not self.composer.is_abstract(template)
+        except ManagedTemplateCompositionSyntaxError:
+            return True
+
+    def render_standalone(
+        self,
+        template: ManagedTemplate,
+        context: "NotificationContextDict",
+        *,
+        parts: TemplatePartResolution,
+    ) -> NotificationSendInput:
+        """Render a template against a context, with no notification.
+
+        For previews, and for checking a version renders before it is published. ``parts``
+        says how a part named without ``version=`` resolves: ``"latest"``, drafts included,
+        for an editor's preview; ``"published"``, the newest ACTIVE version, to see what a send
+        would render. The template is composed with this renderer's composer (its tag prefix
+        and depth limit, reading through this renderer's backend) and rendered by its inner
+        renderer, as a send is.
+
+        The inner renderer is handed ``standalone_notification(template)``: no ID and no
+        recipient. The send input's ``template_version`` is the template's version.
+
+        param template: ManagedTemplate
+        param context: NotificationContextDict
+        param parts: TemplatePartResolution
+        return: NotificationSendInput
+        raises ManagedTemplateCompositionError: if the template cannot be assembled, and
+            whatever the inner renderer raises.
+        """
+        # Built before the compose_templates check, so a bad ``parts`` is refused either way.
+        resolver = part_resolver(self.manager_backend, parts)
+        composed = (
+            self.composer.with_resolver(resolver).compose(template)
+            if self.compose_templates
+            else template
+        )
+        send_input = self.render_from_template_content(
+            standalone_notification(template), self.create_template_content(composed), context
+        )
+        send_input.template_version = template.version
+        return send_input
 
     def render(
         self, notification: "Notification | OneOffNotification", context: "NotificationContextDict"

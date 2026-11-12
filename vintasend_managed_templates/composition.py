@@ -82,10 +82,13 @@ leaves empty composes to nothing rather than to an error.
 Versions
 --------
 
-A reference with no ``version=`` resolves through the backend the same way any other read
-does: to whatever version that key currently is. Pin it when a template must keep composing
-against an exact parent -- re-rendering an old notification resolves the child's version
-explicitly, but its unpinned parents still resolve to today's.
+A reference with no ``version=`` resolves as the composer's resolver says. ``from_backend``
+takes ``parts`` (see ``TemplatePartResolution``): ``"latest"`` (its default, and the service's)
+resolves to the key's newest version, drafts included, which is what an editor previews;
+``"published"`` (the renderer's default for sends) resolves to its newest ACTIVE version. Pin a
+reference when a template must keep composing against an exact parent -- re-rendering an old
+notification resolves the child's version explicitly, but its unpinned parents still resolve to
+today's.
 
 Cycles and depth
 ----------------
@@ -96,11 +99,12 @@ A reference chain that comes back to a template already being composed raises
 engine downstream, so both are found here rather than as a hang at send time.
 """
 
+import copy
 import dataclasses
 import functools
 import re
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, get_args
 
 from .dataclasses import ManagedTemplate
 from .exceptions import (
@@ -108,6 +112,7 @@ from .exceptions import (
     ManagedTemplateCompositionDepthError,
     ManagedTemplateCompositionReferenceError,
     ManagedTemplateCompositionSyntaxError,
+    ManagedTemplateNoActiveVersionError,
     ManagedTemplateNotFoundError,
 )
 
@@ -136,6 +141,19 @@ TemplateField = Literal["body_template", "subject_template", "preheader_template
 # out. ``BaseTemplateManagerBackend.get_template`` satisfies it as it stands.
 TemplateResolver = Callable[[str, "int | None"], ManagedTemplate]
 
+# How a reference with no ``version=`` resolves:
+#
+# * ``"latest"``: the key's newest version whatever its status, drafts included. What an
+#   editor's preview shows: a draft base someone is working on composes into the preview.
+# * ``"published"``: the key's newest ACTIVE version, the same rule a send applies to the
+#   notification's own key. A part with nothing published fails to compose with
+#   ``ManagedTemplateCompositionReferenceError``.
+#
+# A reference that names a version resolves to exactly that version either way.
+TemplatePartResolution = Literal["latest", "published"]
+
+TEMPLATE_PART_RESOLUTIONS: tuple[str, ...] = get_args(TemplatePartResolution)
+
 # The tags that are structure rather than content. Alone on a line, these take the line with
 # them; the placeholder tags never do, so content lands exactly where the tag stood.
 _LINE_TAGS = frozenset({"extends", "block", "endblock"})
@@ -159,6 +177,35 @@ class TemplateReference:
     key: str
     version: "int | None"
     field: str
+
+
+def part_resolver(
+    backend: "BaseTemplateManagerBackend", parts: TemplatePartResolution
+) -> TemplateResolver:
+    """A resolver reading through ``backend`` that resolves unpinned references as ``parts`` says.
+
+    ``"latest"`` is ``backend.get_template``. ``"published"`` reads a pinned reference with
+    ``get_template`` too, and an unpinned one with ``get_active_template`` -- the rule a send
+    applies to the notification's own key.
+
+    param backend: BaseTemplateManagerBackend
+    param parts: TemplatePartResolution
+    return: TemplateResolver
+    raises ValueError: if ``parts`` is neither ``"latest"`` nor ``"published"``.
+    """
+    if parts == "latest":
+        return backend.get_template
+    if parts != "published":
+        raise ValueError(
+            f"parts must be one of {', '.join(TEMPLATE_PART_RESOLUTIONS)}, got {parts!r}."
+        )
+
+    def resolve_published(template_key: str, version: int | None) -> ManagedTemplate:
+        if version is not None:
+            return backend.get_template(template_key, version)
+        return backend.get_active_template(template_key)
+
+    return resolve_published
 
 
 # ----------------------------------------------------------------------
@@ -281,15 +328,36 @@ class TemplateComposer:
         cls,
         backend: "BaseTemplateManagerBackend",
         *,
+        parts: TemplatePartResolution = "latest",
         tag_prefix: str = DEFAULT_TAG_PREFIX,
         max_depth: int = DEFAULT_MAX_DEPTH,
     ) -> "TemplateComposer":
-        """A composer that resolves references through ``backend.get_template``.
+        """A composer that resolves references through ``backend``.
+
+        ``parts`` decides what a reference with no ``version=`` resolves to: ``"latest"`` (the
+        default) reads ``backend.get_template``, drafts included; ``"published"`` reads the
+        key's newest ACTIVE version. See ``TemplatePartResolution``.
 
         param backend: BaseTemplateManagerBackend
+        param parts: TemplatePartResolution
+        return: TemplateComposer
+        raises ValueError: if ``parts`` is neither ``"latest"`` nor ``"published"``.
+        """
+        return cls(part_resolver(backend, parts), tag_prefix=tag_prefix, max_depth=max_depth)
+
+    def with_resolver(self, resolve_template: TemplateResolver) -> "TemplateComposer":
+        """This composer, resolving references through ``resolve_template`` instead.
+
+        The tag prefix and depth limit are kept, and so is a subclass. How a renderer or a
+        service composes the same template under another ``TemplatePartResolution`` without a
+        second composer to configure. ``self`` is left as it was.
+
+        param resolve_template: TemplateResolver
         return: TemplateComposer
         """
-        return cls(backend.get_template, tag_prefix=tag_prefix, max_depth=max_depth)
+        composer = copy.copy(self)
+        composer.resolve_template = resolve_template
+        return composer
 
     # ------------------------------------------------------------------
     # Composing
@@ -606,10 +674,18 @@ class TemplateComposer:
             try:
                 cached = self.resolve_template(reference.key, reference.version)
             except ManagedTemplateNotFoundError as error:
+                # A key that exists with nothing published only reaches here from a resolver
+                # reading published parts, and "does not exist" would send someone looking
+                # for a template that is right there in the editor.
+                problem = (
+                    "which has no active version"
+                    if isinstance(error, ManagedTemplateNoActiveVersionError)
+                    else "which does not exist"
+                )
                 raise ManagedTemplateCompositionReferenceError(
                     f"{reference.kind} references template '{reference.key}'"
                     f"{'' if reference.version is None else f' v{reference.version}'}, "
-                    f"which does not exist{_at(stack, field)}."
+                    f"{problem}{_at(stack, field)}."
                 ) from error
             run.templates[(reference.key, reference.version)] = cached
             # Also under the version it turned out to be, so a later reference that pins it
